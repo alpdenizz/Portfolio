@@ -1,6 +1,3 @@
-# Portfolio
-This repository describes my portfolio of engineering experiences
-
 ## Smart-ID Reverse Engineering
 Reverse-engineered the Smart-ID APK, replicated its functionality and developed some web services to simulate the Smart-ID authentication using Python
 
