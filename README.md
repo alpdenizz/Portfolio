@@ -1,7 +1,7 @@
 ## Smart-ID Reverse Engineering
 Reverse-engineered the [Smart-ID](https://www.smart-id.com) APK, replicated its functionality and developed some web services to simulate the Smart-ID authentication using Python
 
-* Found some Smart-ID APKs in APKPure, decompiled them using `apktool`, analyzed the smali files using VSCode and visualized the jar files using JD-GUI.
+* Found some Smart-ID APKs in [APKPure](https://apkpure.com/smart-id/com.smart_id/versions), decompiled them using `apktool`, analyzed the smali files using VSCode and visualized the jar files using JD-GUI.
 * Replicated the logic using Python, see `smart-id` folder for the Python files.
 * Developed some web services using `Flask` package of Python to simulate the Smart-ID authentication.
 
