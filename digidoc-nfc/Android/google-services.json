@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "419247749053",
+    "project_id": "testriaclean",
+    "storage_bucket": "testriaclean.appspot.com"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:419247749053:android:0d6824266dfc959939c4d4",
+        "android_client_info": {
+          "package_name": "ee.beta.DigiDoc.release"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "419247749053-73libcjomt184k76gfjlb4ler4lg52cq.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDGHaoiSJuGY-yUOxABNAM9dmJ89d3W6a4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "419247749053-73libcjomt184k76gfjlb4ler4lg52cq.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

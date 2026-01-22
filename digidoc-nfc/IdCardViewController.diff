@@ -1,0 +1,1670 @@
+--- IdCardViewController.swift	2025-07-14 05:01:06
++++ IdCardViewController2.swift	2025-08-13 14:18:50
+@@ -22,6 +22,8 @@
+  */
+ 
+ import SkSigningLib
++import CryptoKit
++import CoreNFC
+ 
+ protocol IdCardSignViewKeyboardDelegate : AnyObject {
+     func idCardPINKeyboardWillAppear()
+@@ -32,6 +34,18 @@
+     func idCardDecryptDidFinished(success: Bool, dataFiles: [String:Data], error: Error?)
+ }
+ 
++extension Data {
++    struct HexEncodingOptions: OptionSet {
++        let rawValue: Int
++        static let upperCase = HexEncodingOptions(rawValue: 1 << 0)
++    }
++
++    func hexEncodedString(options: HexEncodingOptions = []) -> String {
++        let format = options.contains(.upperCase) ? "%02hhX" : "%02hhx"
++        return self.map { String(format: format, $0) }.joined()
++    }
++}
++
+ class IdCardViewController : MoppViewController {
+     @IBOutlet weak var scrollView: UIScrollView!
+     @IBOutlet weak var idCardView: UIView!
+@@ -43,12 +57,21 @@
+     @IBOutlet weak var actionButton: ScaledButton!
+     @IBOutlet weak var pinTextFieldTitleLabel: UILabel!
+     @IBOutlet weak var loadingSpinner: SpinnerView!
+-
++    @IBOutlet weak var callerAppAuth: UILabel!
++    
+     var isActionDecryption = false
+     var containerPath: String!
+     var cardCommands: CardCommands?
+     weak var decryptDelegate: IdCardDecryptViewControllerDelegate?
+     weak var keyboardDelegate: IdCardSignViewKeyboardDelegate? = nil
++    
++    //Variables for Digidoc NFC beta
++    var isActionSubmitCAN = false
++    var readNFC = false
++    var nfcOpCompleted = false
++    var nfcPIN = ""
++    var nfcSessionStarted = false
++    //
+ 
+     enum State {
+         case initial
+@@ -60,7 +83,28 @@
+         case readyForTokenAction    // Reader and ID card found
+         case tokenActionInProcess            // Token action in-progress
+         case wrongPin
++        case submitCAN
+     }
++    
++    enum NFCPurpose {
++        case ReadPersonalData
++        case CalculateSignature
++        case InternalAuthenticate
++        case GetSigningCertificate
++        case SignWithoutContainer
++        case Decryption
++    }
++    
++    var nfcPurpose = NFCPurpose.ReadPersonalData
++    var authenticationChallenge: Data?
++    var authenticationIdentifier: Data?
++    var callingAppID: Any?
++    var callingAppScheme: String?
++    var callerHost: String?
++    var includeSignCert: Bool = false
++    var givenSigningCertificate: Data?
++    var givenHashValue: Data?
++    var givenHashFunction: String?
+ 
+     var state: State = .initial {
+         didSet {
+@@ -74,10 +118,11 @@
+     var idCardPersonalData: MoppLibPersonalData? = nil
+ 
+     var accessibilityObjects: [NSObject] = []
+-
++    
+     override func viewDidLoad() {
+         super.viewDidLoad()
+-
++        
++        callerAppAuth.font = titleLabel.font
+         MoppLibCardReaderManager.shared.delegate = self
+ 
+         cancelButton.setTitle(L(.actionCancel).uppercased())
+@@ -85,8 +130,29 @@
+         if isActionDecryption {
+             actionButton.setTitle(L(.actionDecrypt).uppercased())
+             actionButton.accessibilityLabel = L(.actionDecrypt).lowercased()
+-        } else {
++        } else if containerPath == "getSigningCertificate" {
++            actionButton.setTitle(L(.actionConfirm).uppercased())
++            callerAppAuth.isHidden = false
++            callerAppAuth.text = self.callerHost
++            //print("[+] webeid scheme - Disguise background...")
++            ScreenDisguise.shared.showForAuth()
++        } else if containerPath == "sign" {
+             actionButton.setTitle(L(.actionSign).uppercased())
++            callerAppAuth.isHidden = false
++            callerAppAuth.text = self.callerHost
++            //print("[+] webeid scheme - Disguise background...")
++            ScreenDisguise.shared.showForAuth()
++        } else if authenticationChallenge == nil {
++            actionButton.setTitle(L(.actionSign).uppercased())
++        }
++        else {
++            actionButton.setTitle(containerPath.uppercased())
++            //print("[+] Authentication should display caller URL...")
++            callerAppAuth.isHidden = false
++            callerAppAuth.text = self.callerHost
++            
++            //print("[+] webeid scheme - Disguise background...")
++            ScreenDisguise.shared.showForAuth()
+             actionButton.accessibilityLabel = L(.actionSign).lowercased()
+         }
+         
+@@ -100,6 +166,28 @@
+         pinTextField.moppPresentDismissButton()
+ 
+         UIAccessibility.post(notification: UIAccessibility.Notification.layoutChanged, argument: titleLabel)
++        
++        if skipCANVerify() {
++            var personalData = MoppLibPersonalData()
++            personalData.surname = DefaultsHelper.cardholderLastName
++            personalData.givenNames = DefaultsHelper.cardholderFirstName
++            personalData.personalIdentificationCode = DefaultsHelper.cardholderIdentityCode
++            self.idCardPersonalData = personalData
++            noWaitReadyForToken()
++            self.readNFC = true
++            self.nfcPurpose = self.authenticationChallenge != nil ? NFCPurpose.InternalAuthenticate : NFCPurpose.CalculateSignature
++            self.nfcPurpose = self.isActionDecryption ? NFCPurpose.Decryption : self.nfcPurpose
++            if self.containerPath == "getSigningCertificate" {
++                self.nfcPurpose = NFCPurpose.GetSigningCertificate
++            } else if self.containerPath == "sign" {
++                self.nfcPurpose = NFCPurpose.SignWithoutContainer
++            }
++            self.nfcOpCompleted = true
++        } else if NFCTagReaderSession.readingAvailable && DefaultsHelper.CAN.count != 6 {
++            self.readNFC = true
++            //print("[+] setting state to submitCAN at viewDidLoad")
++            self.state = .submitCAN
++        }
+     }
+ 
+     deinit {
+@@ -111,14 +199,66 @@
+ 
+     @objc func editingChanged(sender: UITextField) {
+         let count = (sender.text?.count ?? 0)
++        actionButton.isEnabled = (isActionDecryption || self.authenticationChallenge != nil) ? (count >= 4 && count <= 12) : (count >= 5 && count <= 12)
++        actionButton.isEnabled = (titleLabel.text == "Please enter the 6-digit CAN printed on your ID-card") ? count == 6 : actionButton.isEnabled
++        if !actionButton.isEnabled {
++            actionButton.backgroundColor = UIColor.moppBackgroundDark
++        }
++    }
++    
++    private func noWaitReadyForToken() {
++        self.pinCodeStackView.isHidden = false
++        let fullname = self.idCardPersonalData?.fullName ?? String()
++        let personalCode = self.idCardPersonalData?.personalIdentificationCode ?? String()
+         if self.isActionDecryption {
+-            actionButton.isEnabled = count >= 4 && count <= 12
++            //print("[+] Displaying PIN input view for operation")
++            self.titleLabel.text = L(.cardReaderStateReadyForPin1NFC, [fullname, personalCode])
++            UIAccessibility.post(notification: UIAccessibility.Notification.announcement, argument: L(.cardReaderStateReadyForPin1, [fullname, personalCode]))
++        } else if self.containerPath == "getSigningCertificate" {
++            self.titleLabel.text = L(.cardReaderStateReadyForGetSignCert, [fullname, personalCode])
++            UIAccessibility.post(notification: UIAccessibility.Notification.announcement, argument: L(.cardReaderStateReadyForGetSignCert))
++        }
++        else if self.authenticationChallenge == nil {
++            //print("[+] Displaying PIN input view for operation")
++            self.titleLabel.text = L(.cardReaderStateReadyForPin2NFC, [fullname, personalCode])
++            UIAccessibility.post(notification: UIAccessibility.Notification.announcement, argument: L(.cardReaderStateReadyForPin2, [fullname, personalCode]))
++        }
++        else {
++            //print("[+] Displaying PIN input view for operation")
++            //webeid: auth pin1, sign pin2, get signing certificate does not require pin input view, only text and enable confirm
++            self.titleLabel.text = L(.cardReaderStateReadyForPin1AuthNFC, [fullname, personalCode])
++            UIAccessibility.post(notification: UIAccessibility.Notification.announcement, argument: L(.cardReaderStateReadyForPin1Auth, [fullname, personalCode]))
++        }
++        self.actionButton.isEnabled = false
++        self.pinTextField.isHidden = false
++        self.pinTextField.text = nil
++        self.pinTextFieldTitleLabel.isHidden = false
++        if (self.isActionDecryption || self.authenticationChallenge != nil) {
++            self.pinTextFieldTitleLabel.text = L(.pin1TextfieldLabel)
+         } else {
+-            actionButton.isEnabled = count >= 5 && count <= 12
++            self.pinTextFieldTitleLabel.text = L(.pin2TextfieldLabel)
+         }
+-        if !actionButton.isEnabled {
+-            actionButton.backgroundColor = UIColor.moppBackgroundDark
++        // Voice Control label might not show, showing and hiding the textfield helps
++        if !UIAccessibility.isVoiceOverRunning {
++            printLog("[+] Voice Over running smt like that executes...")
++            self.pinTextField.becomeFirstResponder()
++            self.pinTextField.resignFirstResponder()
++            self.pinTextField.layer.borderColor = UIColor.black.cgColor
+         }
++        //self.pinTextField.layer.borderColor = UIColor.black.cgColor
++        //self.setPinFieldVoiceControlLabel(isDecryption: self.isActionDecryption)
++        //self.pinTextFieldTitleLabel.font = UIFont.setCustomFont(font: .regular, nil, .body)
++        self.pinTextFieldTitleLabel.textColor = UIColor.moppText
++        //if self.loadingSpinner != nil {
++        self.loadingSpinner.show(false)
++        //}
++        if self.containerPath == "getSigningCertificate" {
++            self.actionButton.isEnabled = true
++            self.pinTextField.isHidden = true
++            self.pinTextField.text = nil
++            self.pinTextFieldTitleLabel.isHidden = true
++            self.pinCodeStackView.isHidden = true
++        }
+     }
+ 
+     override func viewWillAppear(_ animated: Bool) {
+@@ -152,9 +292,9 @@
+             queue: OperationQueue.main) { [weak self]_ in
+             guard let sself = self else { return }
+             let showLoading =
+-                sself.state == .initial ||
+-                sself.state == .readerNotFound ||
+-                sself.state == .idCardNotFound ||
++                //sself.state == .initial ||
++                //sself.state == .readerNotFound ||
++                //sself.state == .idCardNotFound ||
+                 sself.state == .tokenActionInProcess
+                 self?.loadingSpinner?.show(showLoading)
+                 if self?.pinTextField != nil {
+@@ -183,6 +323,29 @@
+         NotificationCenter.default.addObserver(self, selector: #selector(hideKeyboardAccessibility), name: .focusedAccessibilityElement, object: nil)
+ 
+         MoppLibCardReaderManager.shared.startDiscoveringReaders()
++        
++        //NFC support - if not NFC, start feitian immediately
++        guard NFCTagReaderSession.readingAvailable else {
++            printLog("[NFC] [-] NFC not supported")
++            return
++        }
++        
++        guard skipCANVerify() else {
++            //todo: directly display CAN input view if CAN is not cached yet. if only can cached then ask this. skipcanverify opens pin if everything is cached.
++            printLog("[NFC] [+] NFC is supported")
++            if DefaultsHelper.CAN.count == 6 {
++                self.readNFC = true
++                self.nfcSessionStarted = true
++                let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: self)
++                session?.alertMessage = "Scan the ID-card with NFC"
++                session?.begin()
++            } else {
++                //print("[+] setting state to submitCAN at viewDidAppear")
++                self.state = .submitCAN
++            }
++            printLog("[NFC] [+] session has begun")
++            return
++        }
+     }
+ 
+     override func viewWillDisappear(_ animated: Bool) {
+@@ -190,6 +353,11 @@
+ 
+         MoppLibCardReaderManager.shared.stopDiscoveringReaders()
+         NotificationCenter.default.removeObserver(self)
++        if callerHost != nil {
++            callerAppAuth.isHidden = true
++            callerAppAuth.text = nil
++            authenticationChallenge = nil
++        }
+     }
+ 
+     @objc func changeState() {
+@@ -197,7 +365,7 @@
+     }
+ 
+     func updateUI(for state: State) {
+-        scrollView.setContentOffset(.zero, animated: true)
++        /*scrollView.setContentOffset(.zero, animated: true)
+         actionButton.isEnabled = false
+         pinTextField.isHidden = true
+         pinTextField.text = nil
+@@ -205,45 +373,166 @@
+         pinTextFieldTitleLabel.text = nil
+         pinTextFieldTitleLabel.textColor = UIColor.moppBaseBackground
+         loadingSpinner?.show(true)
+-        pinCodeStackView?.isHidden = false
++        pinCodeStackView?.isHidden = false*/
++        scrollView.setContentOffset(.zero, animated: true)
+         switch state {
+         case .initial:
++            if self.readNFC { return }
++            if skipCANVerify() {
++                var personalData = MoppLibPersonalData()
++                personalData.surname = DefaultsHelper.cardholderLastName
++                personalData.givenNames = DefaultsHelper.cardholderFirstName
++                personalData.personalIdentificationCode = DefaultsHelper.cardholderIdentityCode
++                self.idCardPersonalData = personalData
++                noWaitReadyForToken()
++                self.readNFC = true
++                self.nfcPurpose = self.authenticationChallenge != nil ? NFCPurpose.InternalAuthenticate : NFCPurpose.CalculateSignature
++                self.nfcPurpose = self.isActionDecryption ? NFCPurpose.Decryption : self.nfcPurpose
++                if self.containerPath == "getSigningCertificate" {
++                    self.nfcPurpose = NFCPurpose.GetSigningCertificate
++                } else if self.containerPath == "sign" {
++                    self.nfcPurpose = NFCPurpose.SignWithoutContainer
++                }
++                self.nfcOpCompleted = true
++                return
++            }
++            actionButton.isEnabled = false
++            pinTextField.isHidden = true
++            pinTextField.text = nil
++            pinTextFieldTitleLabel.isHidden = true
++            pinTextFieldTitleLabel.text = nil
++            pinTextFieldTitleLabel.textColor = UIColor.moppBaseBackground
++            if loadingSpinner != nil {
++                loadingSpinner.show(false)
++            }
++            if pinCodeStackView != nil {
++                pinCodeStackView.isHidden = true
++            }
+             titleLabel.text = L(.cardReaderStateInitial)
+         case .readerNotFound:
++            if self.readNFC { return }
+             UIAccessibility.post(notification: .announcement,  argument: L(.cardReaderStateReaderNotFound))
+             titleLabel.text = L(.cardReaderStateReaderNotFound)
+-            pinCodeStackView?.isHidden = true
++            actionButton.isEnabled = false
++            pinTextField.isHidden = true
++            pinTextField.text = nil
++            pinTextFieldTitleLabel.isHidden = true
++            pinTextFieldTitleLabel.text = nil
++            pinTextFieldTitleLabel.textColor = UIColor.moppBaseBackground
++            if loadingSpinner != nil {
++                loadingSpinner.show(false)
++            }
++            if pinCodeStackView != nil {
++                pinCodeStackView.isHidden = true
++            }
+         case .readerProcessFailed:
++            if self.readNFC { return }
+             UIAccessibility.post(notification: .announcement, argument: L(.cardReaderStateReaderProcessFailed))
+             titleLabel.text = L(.cardReaderStateReaderProcessFailed)
+             pinCodeStackView?.isHidden = true
++            actionButton.isEnabled = false
+         case .readerRestarted:
++            if self.readNFC { return }
+             UIAccessibility.post(notification: .announcement,  argument: L(.cardReaderStateReaderRestarted))
++            actionButton.isEnabled = false
++            pinTextField.isHidden = true
++            pinTextField.text = nil
++            pinTextFieldTitleLabel.isHidden = true
++            pinTextFieldTitleLabel.text = nil
++            pinTextFieldTitleLabel.textColor = UIColor.moppBaseBackground
++            if loadingSpinner != nil {
++                loadingSpinner.show(false)
++            }
++            if pinCodeStackView != nil {
++                pinCodeStackView.isHidden = true
++            }
+             titleLabel.text = L(.cardReaderStateReaderRestarted)
+         case .idCardNotFound:
++            self.readNFC = false
+             UIAccessibility.post(notification: .announcement, argument: L(.cardReaderStateIdCardNotFound))
++            actionButton.isEnabled = false
++            pinTextField.isHidden = true
++            pinTextField.text = nil
++            pinTextFieldTitleLabel.isHidden = true
++            pinTextFieldTitleLabel.text = nil
++            pinTextFieldTitleLabel.textColor = UIColor.moppBaseBackground
++            if loadingSpinner != nil {
++                loadingSpinner.show(false)
++                //loadingSpinner.isHidden = true
++            }
++            if pinCodeStackView != nil {
++                pinCodeStackView.isHidden = true
++            }
+             titleLabel.text = L(.cardReaderStateIdCardNotFound)
+         case .idCardConnected:
++            self.readNFC = false
+             UIAccessibility.post(notification: .announcement, argument: L(.cardReaderStateIdCardConnected))
++            actionButton.isEnabled = false
++            pinTextField.isHidden = true
++            pinTextField.text = nil
++            pinTextFieldTitleLabel.isHidden = true
++            pinTextFieldTitleLabel.text = nil
++            pinTextFieldTitleLabel.textColor = UIColor.moppBaseBackground
++            if loadingSpinner != nil {
++                loadingSpinner.show(true)
++            }
++            if pinCodeStackView != nil {
++                pinCodeStackView.isHidden = false
++            }
+             titleLabel.text = L(.cardReaderStateIdCardConnected)
+         case .tokenActionInProcess:
+-            UIAccessibility.post(notification: .announcement, argument: isActionDecryption ? L(.decryptionInProgress) : L(.signingInProgress))
++            actionButton.isEnabled = false
++            pinTextField.isHidden = true
++            pinTextField.text = nil
++            pinTextFieldTitleLabel.isHidden = true
++            pinTextFieldTitleLabel.text = nil
++            pinTextFieldTitleLabel.textColor = UIColor.moppBaseBackground
++            if loadingSpinner != nil {
++                loadingSpinner.show(true)
++            }
++            if isActionDecryption {
++                titleLabel.text = L(.decryptionInProgress)
++                UIAccessibility.post(notification: UIAccessibility.Notification.layoutChanged, argument: titleLabel)
++            } else if self.containerPath == "getSigningCertificate" {
++                titleLabel.text = L(.getSignCertInProgress)
++                UIAccessibility.post(notification: UIAccessibility.Notification.layoutChanged, argument: titleLabel)
++            }
++            else if self.authenticationChallenge == nil {
++                titleLabel.text = L(.signingInProgress)
++                UIAccessibility.post(notification: UIAccessibility.Notification.layoutChanged, argument: titleLabel)
++            }
++            else {
++                titleLabel.text = L(.authenticationInProgress)
++                UIAccessibility.post(notification: UIAccessibility.Notification.layoutChanged, argument: titleLabel)
++            }
+         case .readyForTokenAction:
+             // Give VoiceOver time to announce "ID-card found"
+             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                 let fullname = self.idCardPersonalData?.fullName ?? String()
+                 let personalCode = self.idCardPersonalData?.personalIdentificationCode ?? String()
+                 if self.isActionDecryption {
+-                    self.titleLabel.text = L(.cardReaderStateReadyForPin1, [fullname, personalCode])
+-                    UIAccessibility.post(notification: .announcement, argument: L(.cardReaderStateReadyForPin1, [fullname, personalCode]))
+-                } else {
+-                    self.titleLabel.text = L(.cardReaderStateReadyForPin2, [fullname, personalCode])
+-                    UIAccessibility.post(notification: .announcement, argument: L(.cardReaderStateReadyForPin2, [fullname, personalCode]))
++                    self.titleLabel.text = L((self.readNFC ? .cardReaderStateReadyForPin1NFC : .cardReaderStateReadyForPin1), [fullname, personalCode])
++                    UIAccessibility.post(notification: UIAccessibility.Notification.announcement, argument: L(.cardReaderStateReadyForPin1, [fullname, personalCode]))
++                } else if self.authenticationChallenge == nil {
++                    self.titleLabel.text = L((self.readNFC ? .cardReaderStateReadyForPin2NFC : .cardReaderStateReadyForPin2), [fullname, personalCode])
++                    UIAccessibility.post(notification: UIAccessibility.Notification.announcement, argument: L(.cardReaderStateReadyForPin2, [fullname, personalCode]))
++                } else if self.containerPath == "getSigningCertificate" {
++                    self.titleLabel.text = L(.cardReaderStateReadyForGetSignCert, [fullname, personalCode])
++                    UIAccessibility.post(notification: UIAccessibility.Notification.announcement, argument: L(.cardReaderStateReadyForGetSignCert))
+                 }
++                else {
++                    //web eid function: auth, sign, get signing certificate
++                    self.titleLabel.text = L((self.readNFC ? .cardReaderStateReadyForPin1AuthNFC : .cardReaderStateReadyForPin1Auth), [fullname, personalCode])
++                    UIAccessibility.post(notification: UIAccessibility.Notification.announcement, argument: L(.cardReaderStateReadyForPin1Auth, [fullname, personalCode]))
++                }
+                 self.loadingSpinner?.show(false)
+                 self.pinTextField.isHidden = false
+                 self.pinTextFieldTitleLabel.isHidden = false
+-                self.pinTextFieldTitleLabel.text = self.isActionDecryption ? L(.pin1TextfieldLabel) : L(.pin2TextfieldLabel)
++                if (self.isActionDecryption || self.authenticationChallenge != nil) {
++                    self.pinTextFieldTitleLabel.text = L(.pin1TextfieldLabel)
++                } else {
++                    self.pinTextFieldTitleLabel.text = L(.pin2TextfieldLabel)
++                }
+                 self.pinTextFieldTitleLabel.textColor = UIColor.moppText
+                 // Voice Control label might not show, showing and hiding the textfield helps
+                 if !UIAccessibility.isVoiceOverRunning {
+@@ -252,28 +541,62 @@
+                     self.pinTextField.layer.borderColor = UIColor.black.cgColor
+                 }
+                 self.setPinFieldVoiceControlLabel(isDecryption: self.isActionDecryption)
++                if self.containerPath == "getSigningCertificate" {
++                    self.actionButton.isEnabled = true
++                    self.pinTextField.isHidden = true
++                    self.pinTextField.text = nil
++                    self.pinTextFieldTitleLabel.isHidden = true
++                }
+             }
+         case .wrongPin:
+             let fullname = idCardPersonalData?.fullName ?? String()
+             let personalCode = idCardPersonalData?.personalIdentificationCode ?? String()
+-            if isActionDecryption {
+-                titleLabel.text = L(.cardReaderStateReadyForPin1, [fullname, personalCode])
+-                UIAccessibility.post(notification: .layoutChanged, argument: titleLabel)
++            if self.isActionDecryption {
++                self.titleLabel.text = L((self.readNFC ? .cardReaderStateReadyForPin1NFC : .cardReaderStateReadyForPin1), [fullname, personalCode])
++                UIAccessibility.post(notification: UIAccessibility.Notification.announcement, argument: L(.cardReaderStateReadyForPin1, [fullname, personalCode]))
++            } else if self.authenticationChallenge == nil {
++                self.titleLabel.text = L((self.readNFC ? .cardReaderStateReadyForPin2NFC : .cardReaderStateReadyForPin2), [fullname, personalCode])
++                UIAccessibility.post(notification: UIAccessibility.Notification.announcement, argument: L(.cardReaderStateReadyForPin2, [fullname, personalCode]))
+             } else {
+-                titleLabel.text = L(.cardReaderStateReadyForPin2, [fullname, personalCode])
+-                UIAccessibility.post(notification: .layoutChanged, argument: titleLabel)
++                //webeid auth and sign
++                self.titleLabel.text = L((self.readNFC ? .cardReaderStateReadyForPin1AuthNFC : .cardReaderStateReadyForPin1Auth), [fullname, personalCode])
++                UIAccessibility.post(notification: UIAccessibility.Notification.announcement, argument: L(.cardReaderStateReadyForPin1Auth, [fullname, personalCode]))
+             }
+-            loadingSpinner?.show(false)
++            actionButton.isEnabled = false
+             pinTextField.isHidden = false
++            pinTextField.text = nil
+             pinTextFieldTitleLabel.isHidden = false
++            pinTextField.text = nil
++            if loadingSpinner != nil {
++                loadingSpinner.show(false)
++            }
+             pinTextFieldTitleLabel.textColor = UIColor.moppError
+             if isActionDecryption {
+                 pinTextFieldTitleLabel.text = pinAttemptsLeft > 1 ? L(.wrongPin1, [pinAttemptsLeft]) : L(.wrongPin1Single)
+-                UIAccessibility.post(notification: .layoutChanged, argument: pinTextFieldTitleLabel)
+-            } else {
++                UIAccessibility.post(notification: UIAccessibility.Notification.layoutChanged, argument: pinTextFieldTitleLabel)
++            } else if self.authenticationChallenge == nil {
++                //sign
+                 pinTextFieldTitleLabel.text = pinAttemptsLeft > 1 ? L(.wrongPin2, [pinAttemptsLeft]) : L(.wrongPin2Single)
+-                UIAccessibility.post(notification: .layoutChanged, argument: pinTextFieldTitleLabel)
++                UIAccessibility.post(notification: UIAccessibility.Notification.layoutChanged, argument: pinTextFieldTitleLabel)
++            } else if self.authenticationChallenge != nil {
++                //webeid auth
++                pinTextFieldTitleLabel.text = pinAttemptsLeft > 1 ? L(.wrongPin1, [pinAttemptsLeft]) : L(.wrongPin1Single)
++                UIAccessibility.post(notification: UIAccessibility.Notification.layoutChanged, argument: pinTextFieldTitleLabel)
+             }
++        
++        case .submitCAN:
++            self.isActionSubmitCAN = true
++            self.pinCodeStackView.isHidden = false
++            self.pinTextField.isHidden = false
++            self.pinTextField.text = nil
++            self.actionButton.isEnabled = false
++            self.pinTextFieldTitleLabel.isHidden = true
++            self.pinTextFieldTitleLabel.text = nil
++            if loadingSpinner != nil {
++                loadingSpinner.show(false)
++            }
++            self.titleLabel.text = "Please enter the 6-digit CAN printed on your ID-card"
++            self.actionButton.setTitle("SUBMIT")
+         }
+ 
+         guard let actionUIButton = actionButton else { printLog("Unable to get actionButton"); return }
+@@ -321,9 +644,28 @@
+ 
+     @IBAction func cancelAction() {
+         let actionCancelled = state == .tokenActionInProcess
++        //check by title text
++        if self.titleLabel.text == "Please enter the 6-digit CAN printed on your ID-card" {
++            //print("[+] submit CAN cancelling should return to feitian reader status")
++            self.readNFC = false
++            self.isActionSubmitCAN = false
++            self.state = .initial
++            return
++        }
+         dismiss(animated: false) {
+             [weak self] in
+             guard let sself = self else { return }
++            if sself.callerHost != nil {
++                //print("[+] cancelled webeid function using CANCEL button in ID-card dialog view")
++                UIAccessibility.post(notification: .screenChanged, argument: L(.webeidCancelled))
++                if let caller_url = MoppApp.instance.callerURL {
++                    var components = URLComponents(url: caller_url, resolvingAgainstBaseURL: true)
++                    components?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_USER_CANCELLED", message: "Request was cancelled by the user")
++                    MoppApp.instance.stopUserInteractionTimer()
++                    UIApplication.shared.open(components!.url!)
++                }
++                return
++            }
+             if actionCancelled {
+                 ErrorUtil.generateError(signingError: L(.signingAbortedMessage))
+             }
+@@ -340,9 +682,37 @@
+             // TODO: Display error message about empty PIN 2 text field
+             return
+         }
++        
++        if self.titleLabel.text == "Please enter the 6-digit CAN printed on your ID-card" {
++            //print("[+] Caching CAN value, starting a new NFC session")
++            DefaultsHelper.CAN = pin
++            printLog("[NFC] [+] Decryption over NFC...")
++            guard NFCTagReaderSession.readingAvailable else {
++                printLog("[NFC] [-] NFC not supported")
++                return
++            }
++            self.nfcSessionStarted = true
++            let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: self)
++            session?.alertMessage = "Scan your ID-card with NFC to complete the operation"
++            session?.begin()
++            return
++        }
+ 
+         state = .tokenActionInProcess
+         if isActionDecryption {
++            if(self.readNFC) {
++                self.nfcPIN = pin
++                printLog("[NFC] [+] Decryption over NFC...")
++                guard NFCTagReaderSession.readingAvailable else {
++                    printLog("[NFC] [-] NFC not supported")
++                    return
++                }
++                self.nfcSessionStarted = true
++                let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: self)
++                session?.alertMessage = "Scan the ID-card with NFC to complete the operation"
++                session?.begin()
++                return
++            }
+             guard let cardCommands else {
+                 decryptDelegate?.idCardDecryptDidFinished(success: false, dataFiles: .init(), error: MoppLibError.Code.cardNotFound)
+                 return
+@@ -368,7 +738,98 @@
+                     }
+                 }
+             )
+-        } else if DefaultsHelper.isRoleAndAddressEnabled {
++        } else if self.readNFC && MoppApp.instance.callerHost.isNilOrEmpty {
++            //regular signing (not app-requested using hash signature)
++            //print("[NFC] [+] Calculating signature over NFC...")
++            self.nfcPIN = pin
++            //NFC part
++            guard NFCTagReaderSession.readingAvailable else {
++                printLog("[NFC] [-] NFC not supported")
++                return
++            }
++            self.nfcSessionStarted = true
++            let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: self)
++            session?.alertMessage = "Scan your ID-card with NFC to complete the operation"
++            session?.begin()
++            printLog("[NFC] [+] session has begun")
++            return
++        } else if containerPath == "getSigningCertificate" {
++            //print("[+] [getcert] Reading signing cert")
++            let unverifiedSigningCertificate = DefaultsHelper.cardholderSignCert.base64EncodedString()
++            let supportedSignatureAlgorithms = [["cryptoAlgorithm": "ECC", "hashFunction": "SHA-256", "paddingScheme":"NONE"],
++                                                    ["cryptoAlgorithm": "ECC", "hashFunction": "SHA-384", "paddingScheme":"NONE"],
++                                                    ["cryptoAlgorithm": "ECC", "hashFunction": "SHA-512", "paddingScheme":"NONE"]]
++            let token : [String:Any] = ["unverifiedSigningCertificate":unverifiedSigningCertificate, "supportedSignatureAlgorithms":supportedSignatureAlgorithms]
++            let json = try? JSONSerialization.data(withJSONObject: token, options: .prettyPrinted)
++            guard let webeidtoken = json else {return}
++            let tokenEncoded = {
++                    let base64url = webeidtoken.base64EncodedString()
++                        .replacingOccurrences(of: "+", with: "-")
++                        .replacingOccurrences(of: "/", with: "_")
++                        .replacingOccurrences(of: "=", with: "")
++                    return base64url
++                }
++            var components = URLComponents(url: MoppApp.instance.callerURL!, resolvingAgainstBaseURL: true)
++            components?.fragment = tokenEncoded()
++            MoppApp.instance.callerHost = nil
++            MoppApp.instance.callerURL = nil
++            MoppApp.instance.stopUserInteractionTimer()
++            UIApplication.shared.open(components!.url!) { (result) in
++                    if result {
++                       //print("[+] URL delivered successfully")
++                       //print("[+] webeid function finished - hide disguise...")
++                       DispatchQueue.main.async {
++                           ScreenDisguise.shared.hideForAuth()
++                           self.dismiss(animated: false, completion: nil)
++                       }
++                    }
++                    else {
++                       //print("[-] URL not delivered: something went wrong")
++                    }
++            }
++        } else if containerPath == "sign" {
++            if self.readNFC {
++                self.nfcPIN = pin
++                //NFC part
++                guard NFCTagReaderSession.readingAvailable else {
++                    printLog("[NFC] [-] NFC not supported")
++                    return
++                }
++                self.nfcSessionStarted = true
++                let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: self)
++                session?.alertMessage = "Scan your ID-card with NFC to complete the operation"
++                session?.begin()
++                printLog("[NFC] [+] session has begun")
++                return
++            } else {
++                //sign no container no nfc, feitian reader
++                signNoContainerNoNFC(pin)
++            }
++        } else if containerPath == "authenticate" {
++            if self.readNFC {
++                self.nfcPIN = pin
++                printLog("[NFC] [+] authentication over NFC...")
++                //NFC part
++                guard NFCTagReaderSession.readingAvailable else {
++                    printLog("[NFC] [-] NFC not supported")
++                    return
++                }
++                self.nfcSessionStarted = true
++                let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: self)
++                session?.alertMessage = "Scan your ID-card with NFC to complete the operation"
++                session?.begin()
++                printLog("[NFC] [+] session has begun")
++                return
++            } else {
++                //auth no nfc, feitian reader
++                let challengeHash = SHA384.hash(data: self.authenticationChallenge!).data
++                var originHash = SHA384.hash(data: Data(self.callerHost!.utf8)).data
++                originHash.append(challengeHash)
++                let authInput = SHA384.hash(data: originHash).data
++                authNoNFC(pin, input: authInput)
++            }
++        }
++        else if DefaultsHelper.isRoleAndAddressEnabled {
+             let roleAndAddressView = UIStoryboard.tokenFlow.instantiateViewController(of: RoleAndAddressViewController.self)
+             roleAndAddressView.modalPresentationStyle = .overCurrentContext
+             roleAndAddressView.modalTransitionStyle = .crossDissolve
+@@ -378,6 +839,174 @@
+             sign(pin)
+         }
+     }
++    
++    func signNoContainerNoNFC(_ pin: String) {
++        Task {
++            do {
++                //not working as expected, so skip for now
++                /*guard MoppLibManager.shared.isConnected else {
++                    throw MoppLibError.Code.noInternetConnection
++                }*/
++                guard let cardCommands else {
++                    throw MoppLibError.Code.cardNotFound
++                }
++                guard try await cardCommands.readCodeCounterRecord(.pin2) != 0 else {
++                    throw MoppLibError.Code.pinBlocked
++                }
++                guard let givenSignCert = self.givenSigningCertificate, DefaultsHelper.cardholderSignCert.elementsEqual(givenSignCert) else {
++                    throw MoppLibError.Code.signCertificateMismatch
++                }
++                var signedData : [UInt8] = []
++                let arr = [UInt8](self.givenHashValue!)
++                if arr.count <= 48 {
++                    signedData = [UInt8](repeating: 0, count: (48-arr.count))
++                    signedData.append(contentsOf: arr)
++                } else {
++                    signedData = Array(arr[0..<48])
++                }
++                let res = try cardCommands.calculateSignature(for: Data(signedData), withPin2: pin)
++                await MainActor.run {
++                    self.dismiss(animated: false) {
++                        //do after dialog dismiss
++                        let signature = res.base64EncodedString()
++                        let signatureAlgorithm = ["cryptoAlgorithm": "ECC", "hashFunction": self.givenHashFunction!, "paddingScheme": "NONE"]
++                        let token : [String:Any] = ["signature": signature, "signatureAlgorithm":signatureAlgorithm]
++                        guard let webeidtoken = try? JSONSerialization.data(withJSONObject: token, options: .prettyPrinted) else {return}
++                        ////print("[+] Web eID token produced: \(String(data: webeidtoken, encoding: .utf8)!)")
++                        let tokenEncoded = {
++                            //webeidtoken.append(Data(repeating: 50, count: 75 << 20))
++                            let base64url = webeidtoken.base64EncodedString()
++                                .replacingOccurrences(of: "+", with: "-")
++                                .replacingOccurrences(of: "/", with: "_")
++                                .replacingOccurrences(of: "=", with: "")
++                            return base64url
++                        }
++                        var components = URLComponents(url: MoppApp.instance.callerURL!, resolvingAgainstBaseURL: true)
++                        components?.fragment = tokenEncoded()
++                        MoppApp.instance.callerHost = nil
++                        MoppApp.instance.callerURL = nil
++                        MoppApp.instance.stopUserInteractionTimer()
++                        UIApplication.shared.open(components!.url!) { (result) in
++                            if result {
++                               //print("[+] URL delivered successfully")
++                                ScreenDisguise.shared.hideForAuth()
++                            }
++                            else {
++                               //print("[-] URL not delivered: something went wrong")
++                            }
++                        }
++                    }
++                }
++            } catch let error as NSError {
++                //print("[-] Error during app-requested signature: \(error)")
++                await MainActor.run {
++                    if error == .wrongPin {
++                        self.pinAttemptsLeft = (error.userInfo[MoppLibError.kMoppLibUserInfoRetryCount] as? NSNumber)?.uintValue ?? 0
++                        self.state = .wrongPin
++                    } else {
++                        if let ch = MoppApp.instance.callerURL {
++                            var components = URLComponents(url: ch, resolvingAgainstBaseURL: true)
++                            components?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_NATIVE_FATAL", message: error.localizedDescription)
++                            MoppApp.instance.callerHost = nil
++                            MoppApp.instance.callerURL = nil
++                            MoppApp.instance.stopUserInteractionTimer()
++                            UIApplication.shared.open(components!.url!)
++                        }
++                        self.dismiss(animated: false) {
++                            ErrorUtil.generateError(signingError: error, signingType:SigningType.idCard)
++                        }
++                    }
++                }
++            }
++        }
++    }
++    
++    func authNoNFC(_ pin: String, input: Data) {
++        Task {
++            do {
++                //not working as expected, so skip for now
++                /*guard MoppLibManager.shared.isConnected else {
++                    throw MoppLibError.Code.noInternetConnection
++                }*/
++                guard let cardCommands else {
++                    throw MoppLibError.Code.cardNotFound
++                }
++                guard try await cardCommands.readCodeCounterRecord(.pin1) != 0 else {
++                    throw MoppLibError.Code.pinBlocked
++                }
++                let authResult = try cardCommands.authenticate(for: input, withPin1: pin)
++                //return auth signature to the caller
++                await MainActor.run {
++                    self.dismiss(animated: false) {
++                        //do after dialog dismiss
++                        let ssignature = authResult.base64EncodedString()
++                        let unverifiedCertificate = DefaultsHelper.cardholderAuthCert.base64EncodedString()
++                        let unverifiedSigningCertificate = DefaultsHelper.cardholderSignCert.base64EncodedString()
++                        let appVersion = "https://www.id.ee/en/rubriik/ria-digidoc-application/"
++                        let format = "web-eid:1.1"
++                        let algorithm = "ES384"
++                        var token : [String:Any] = ["appVersion":appVersion, "unverifiedCertificate":unverifiedCertificate, "signature":ssignature, "format":format, "algorithm":algorithm]
++                        
++                        if self.includeSignCert {
++                            token.updateValue(unverifiedSigningCertificate, forKey: "unverifiedSigningCertificate")
++                            let supportedSignatureAlgorithms = [["cryptoAlgorithm": "ECC", "hashFunction": "SHA-256", "paddingScheme":"NONE"],
++                                                                ["cryptoAlgorithm": "ECC", "hashFunction": "SHA-384", "paddingScheme":"NONE"],
++                                                                ["cryptoAlgorithm": "ECC", "hashFunction": "SHA-512", "paddingScheme":"NONE"]]
++                            token.updateValue(supportedSignatureAlgorithms, forKey: "supportedSignatureAlgorithms")
++                        }
++                        
++                        guard let webeidtoken = try? JSONSerialization.data(withJSONObject: token, options: .prettyPrinted) else {return}
++                        ////print("[+] Web eID token produced: \(String(data: webeidtoken, encoding: .utf8)!)")
++                        let tokenEncoded = {
++                            //webeidtoken.append(Data(repeating: 50, count: 75 << 20))
++                            let base64url = webeidtoken.base64EncodedString()
++                                .replacingOccurrences(of: "+", with: "-")
++                                .replacingOccurrences(of: "/", with: "_")
++                                .replacingOccurrences(of: "=", with: "")
++                            return base64url
++                        }
++                        var components = URLComponents(url: MoppApp.instance.callerURL!, resolvingAgainstBaseURL: true)
++                        components?.fragment = tokenEncoded()
++                        MoppApp.instance.callerHost = nil
++                        MoppApp.instance.callerURL = nil
++                        MoppApp.instance.stopUserInteractionTimer()
++                        UIApplication.shared.open(components!.url!)
++                        { (result) in
++                            if result {
++                               printLog("[+] URL delivered successfully")
++                               DispatchQueue.main.async {
++                                    //print("[+] webeid function finished - hide disguise...")
++                                    ScreenDisguise.shared.hideForAuth()
++                               }
++                            }
++                            else {
++                               printLog("[-] URL not delivered: something went wrong")
++                            }
++                        }
++                    }
++                }
++            } catch let error as NSError {
++                await MainActor.run {
++                    if error == .wrongPin {
++                        self.pinAttemptsLeft = (error.userInfo[MoppLibError.kMoppLibUserInfoRetryCount] as? NSNumber)?.uintValue ?? 0
++                        self.state = .wrongPin
++                    } else {
++                        if let ch = MoppApp.instance.callerURL {
++                            var components = URLComponents(url: ch, resolvingAgainstBaseURL: true)
++                            components?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_NATIVE_FATAL", message: error.localizedDescription)
++                            MoppApp.instance.callerHost = nil
++                            MoppApp.instance.callerURL = nil
++                            MoppApp.instance.stopUserInteractionTimer()
++                            UIApplication.shared.open(components!.url!)
++                        }
++                        self.dismiss(animated: false) {
++                            ErrorUtil.generateError(signingError: error, signingType:SigningType.idCard)
++                        }
++                    }
++                }
++            }
++        }
++    }
+ 
+     func sign(_ pin: String) {
+         Task {
+@@ -443,8 +1072,766 @@
+     }
+ }
+ 
++//TODO: Decryption with NFC
++class NFCDecryptor : AbstractSmartToken {
++    let comms: Comms?
++    let authCert: Data?
++    let pin1: String?
++    init(comms: Comms?, authCert: Data?, pin1: String?) {
++        self.comms = comms
++        self.authCert = authCert
++        self.pin1 = pin1
++    }
++    func getCertificate() async throws -> Data {
++        //auth certificate NFC
++        return authCert!
++    }
++    func derive(_ data: Data) throws -> Data {
++        //derive shared secret NFC
++        printLog("[NFC] [+] Decryption: deriving shared secret using PIN1...")
++        let sharedSecret = comms!.decryptSync(PIN1: pin1!, ecPubKey: [UInt8](data))
++        return sharedSecret
++    }
++    func decrypt(_ data: Data) throws -> Data {
++        printLog("[NFC] [+] This is not supposed to be called because we are using ECC keys")
++        return Data()
++    }
++    func authenticate(_ data: Data) throws -> Data {
++        return Data()
++    }
++}
++//
++
++func skipCANVerify() -> Bool {
++    return DefaultsHelper.cardholderFirstName.count > 0 &&
++    DefaultsHelper.cardholderLastName.count > 0 &&
++    DefaultsHelper.cardholderIdentityCode.count > 0 &&
++    DefaultsHelper.cardholderAuthCert.count > 0 &&
++    DefaultsHelper.cardholderSignCert.count > 0 &&
++    DefaultsHelper.CAN.count == 6
++}
++
++func encodedAppRequestedError(code: String, message: String) -> String {
++    let token = ["error":["code":code, "message":message]]
++    guard let webeidtoken = try? JSONSerialization.data(withJSONObject: token, options: .prettyPrinted) else {
++        return ""
++    }
++    let base64url = webeidtoken.base64EncodedString()
++            .replacingOccurrences(of: "+", with: "-")
++            .replacingOccurrences(of: "/", with: "_")
++            .replacingOccurrences(of: "=", with: "")
++    return base64url
++}
++
++extension IdCardViewController : NFCTagReaderSessionDelegate {
++    func tagReaderSession(_ session: NFCTagReaderSession, didDetect tags: [NFCTag]) {
++        //print("[NFC] this session is \(session)")
++        printLog("[NFC] [+] NFC tag detected")
++        guard tags.count == 1 else {
++                printLog("[NFC] [-] More than 1 NFC tags detected, aborting...")
++                //session.alertMessage = "More than 1 tag!"
++                self.nfcSessionStarted = false
++                session.invalidate(errorMessage: "More than 1 tag!")
++                return
++            }
++        let tag = tags.first!
++        let purpose = self.nfcPurpose
++        session.connect(to: tag) { error in
++                guard error == nil else {
++                    printLog("[NFC] [-] Connection error: \(error!)")
++                    //print("[NFC] [-] Connection error: \(error!)")
++                    self.nfcSessionStarted = false
++                    session.invalidate(errorMessage: "Unrecognized NFC card")
++                    return
++                }
++                if case let .iso7816(detectedTag) = tag {
++                    //TODO: check historical bytes similar to Android code (hex): 0012233f536549440f9000
++                    let historicalBytes = detectedTag.historicalBytes!
++                    printLog("[NFC] [+] should be estonian id card historical bytes: \(historicalBytes.toHexString())")
++                    guard historicalBytes.toHexString().elementsEqual("0012233f536549440f9000") else {
++                        self.nfcSessionStarted = false
++                        session.invalidate(errorMessage: "Unrecognized NFC card")
++                        return
++                    }
++                    printLog("[NFC] [+] Tag available: \(detectedTag.isAvailable)")
++                    session.alertMessage = "Please hold still. Communicating via NFC…"
++                    guard DefaultsHelper.CAN.count == 6 else {
++                        //submit CAN
++                        //print("[+] CAN is not cached yet, displaying CAN input view...")
++                        self.nfcSessionStarted = false
++                        session.invalidate(errorMessage: "Please enter the 6-digit CAN printed on your ID-card")
++                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: {
++                            self.state = .submitCAN
++                        })
++                        return
++                    }
++                    let comms = Comms(idCard: detectedTag, CAN: DefaultsHelper.CAN)
++                    Task {
++                        //print("[NFC] [+] Start PACE")
++                        let established = await comms.performPACEAsync()
++                        if let err = established {
++                            printLog("[NFC] [-] Error during CAN verification")
++                            ////print("[NFC] [-] Error during CAN verification: \(err)")
++                            if err.localizedDescription == "Wrong CAN" {
++                                DefaultsHelper.CAN = ""
++                                DefaultsHelper.cardholderFirstName = ""
++                                DefaultsHelper.cardholderLastName = ""
++                                DefaultsHelper.cardholderIdentityCode = ""
++                                DefaultsHelper.cardholderAuthCert = Data()
++                                DefaultsHelper.cardholderSignCert = Data()
++                                session.invalidate(errorMessage: err.localizedDescription)
++                                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: {
++                                    //data is deleted, so we need to read it again
++                                    self.nfcPurpose = .ReadPersonalData
++                                    self.state = .submitCAN
++                                    self.pinTextFieldTitleLabel.textColor = UIColor.moppError
++                                    self.pinTextFieldTitleLabel.text = "Wrong CAN"
++                                    self.pinTextFieldTitleLabel.isHidden = false
++                                    UIAccessibility.post(notification: UIAccessibility.Notification.layoutChanged, argument: self.pinTextFieldTitleLabel)
++                                })
++                                return
++                            } else if err.domain == "MoppLib" {
++                                self.nfcSessionStarted = false
++                                session.invalidate(errorMessage: err.localizedDescription)
++                                DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: {
++                                    ////print("[- NFC inside dispatch queue] NFC got interrupted, dismiss id card view controller...")
++                                    if self.isActionDecryption {
++                                        self.dismiss(animated: false, completion: {
++                                            self.decryptDelegate?.idCardDecryptDidFinished(success: false, dataFiles: [:], error: err)
++                                        })
++                                    }
++                                    else {
++                                        self.dismiss(animated: false, completion: {
++                                            //there is no sign delegate
++                                            ErrorUtil.generateError(signingError: err, signingType:SigningType.idCard)
++                                            //self.signDelegate?.idCardSignDidFinished(cancelled: false, success: false, error: err)
++                                        })
++                                    }
++                                })
++                            } else {
++                                //print("[NFC] [-] communication got interrupted, starting another session...")
++                                session.invalidate(errorMessage: "NFC communication got interrupted")
++                                DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: {
++                                    //start new session after 3.5 seconds (if readnfc part from feitian case)
++                                    self.nfcSessionStarted = true
++                                    let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: self)
++                                    session?.alertMessage = "Scan your ID-card with NFC to complete the operation"
++                                    session?.begin()
++                                    
++                                    printLog("[NFC] [+] session has begun again without asking input")
++                                    //print("[NFC] [+] session has begun again without asking input")
++                                    return
++                                })
++                                return
++                            }
++                        }
++                        DispatchQueue.main.async {
++                            self.isActionSubmitCAN = false
++                            if self.isActionDecryption {
++                                self.actionButton.setTitle(L(.actionDecrypt).uppercased())
++                                self.actionButton.isEnabled = false
++                            } else if self.containerPath == "getSigningCertificate" {
++                                self.actionButton.setTitle(L(.actionConfirm).uppercased())
++                                self.actionButton.isEnabled = true
++                            }
++                            else if self.authenticationChallenge == nil {
++                                self.actionButton.setTitle(L(.actionSign).uppercased())
++                                self.actionButton.isEnabled = false
++                            } else {
++                                self.actionButton.setTitle(L(.actionAuthenticate).uppercased())
++                                self.actionButton.isEnabled = false
++                            }
++                        }
++                        if (established == nil) && (purpose == NFCPurpose.ReadPersonalData) {
++                            //print("[NFC] [+] End PACE")
++                            printLog("[NFC] [+] Start Reading Personal Data")
++                            //print("[NFC] [+] Start Reading Personal Data")
++                            let result = await comms.readPersonalDataAsync(lastBytes: [UInt8(1),UInt8(2),UInt8(3),UInt8(4),UInt8(5),UInt8(6),UInt8(7),UInt8(8)])
++                            let authCertBytes = await comms.getCertificateAsync(isAuthCert: true)
++                            let signCertBytes = await comms.getCertificateAsync(isAuthCert: false)
++                            printLog("[NFC] [+] End Reading Personal Data")
++                            //print("[NFC] [+] End Reading Personal Data")
++                            var personalData = MoppLibPersonalData.init()
++                            if let arr = result, let authCert = authCertBytes, let signCert = signCertBytes {
++                                personalData.surname = arr[0]
++                                DefaultsHelper.cardholderLastName = arr[0]
++                                
++                                personalData.givenNames = arr[1]
++                                DefaultsHelper.cardholderFirstName = arr[1]
++                                
++                                personalData.sex = arr[2]
++                                personalData.nationality = arr[3]
++                                personalData.birthDate = arr[4]
++                                
++                                personalData.personalIdentificationCode = arr[5]
++                                DefaultsHelper.cardholderIdentityCode = arr[5]
++                                
++                                DefaultsHelper.cardholderAuthCert = Data(authCert)
++                                DefaultsHelper.cardholderSignCert = Data(signCert)
++                                
++                                personalData.documentNumber = arr[6]
++                                personalData.expiryDate = arr[7]
++                                self.readNFC = true
++                                self.nfcPurpose = self.authenticationChallenge != nil ? NFCPurpose.InternalAuthenticate : NFCPurpose.CalculateSignature
++                                self.nfcPurpose = self.isActionDecryption ? NFCPurpose.Decryption : self.nfcPurpose
++                                self.nfcOpCompleted = true
++                                self.nfcSessionStarted = false
++                                detectedTag.session?.alertMessage = "Reading ID-card data completed"
++                                detectedTag.session?.invalidate()
++                                
++                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: {
++                                    self.idCardPersonalData = personalData
++                                    self.state = .readyForTokenAction
++                                })
++                            } else {
++                                self.nfcSessionStarted = false
++                                session.invalidate(errorMessage: "NFC communication got interrupted")
++                                DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: {
++                                    //start new session after 3.5 seconds (if readnfc part from feitian case)
++                                    self.nfcSessionStarted = true
++                                    let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: self)
++                                    session?.alertMessage = "Scan your ID-card with NFC to complete the operation"
++                                    session?.begin()
++                                    
++                                    return
++                                })
++                                return
++                            }
++                        }
++                        if (established == nil) && (purpose == NFCPurpose.CalculateSignature) {
++                            //get signature cert = webeid sign does not require container, so call different mopplib function at some point
++                            //print("[NFC] [+] signing with NFC")
++                            if DefaultsHelper.cardholderSignCert.count > 0 {
++                                //use new sign approach
++                                do {
++                                    let dataToSign = try MoppLibContainerActions.prepareSignature(
++                                        DefaultsHelper.cardholderSignCert,
++                                        containerPath: self.containerPath,
++                                        roleData: DefaultsHelper.isRoleAndAddressEnabled ? RoleAndAddressUtil.getSavedRoleInfo() : nil,
++                                        sendDiagnostics: .Devices
++                                    )
++                                    //let signature = try cardCommands.calculateSignature(for: dataToSign, withPin2: pin)
++                                    let signature = try await comms.calculateSignatureAsync(PIN2: self.nfcPIN, signedData: [UInt8](dataToSign))
++                                    try MoppLibContainerActions.isSignatureValid(Data(signature!))
++                                    detectedTag.session?.alertMessage = "Signing completed"
++                                    self.nfcSessionStarted = false
++                                    detectedTag.session?.invalidate()
++                                    //print("[+] signing completed, creating container verification screen...")
++                                    await MainActor.run {
++                                        self.dismiss(animated: false) {
++                                            NotificationCenter.default.post(
++                                                name: .signatureCreatedFinishedNotificationName,
++                                                object: nil,
++                                                userInfo: nil)
++                                        }
++                                    }
++                                } catch let error as NSError {
++                                    await MainActor.run {
++                                        if error == .wrongPin {
++                                            self.nfcSessionStarted = false
++                                            detectedTag.session?.invalidate(errorMessage: error.localizedDescription)
++                                            self.pinAttemptsLeft = (error.userInfo[MoppLibError.kMoppLibUserInfoRetryCount] as? NSNumber)?.uintValue ?? 0
++                                            self.state = .wrongPin
++                                        } else if error.domain == "MoppLib" {
++                                            self.nfcSessionStarted = false
++                                            detectedTag.session?.invalidate(errorMessage: error.localizedDescription)
++                                            self.dismiss(animated: false) {
++                                                ErrorUtil.generateError(signingError: error, signingType:SigningType.idCard)
++                                            }
++                                        } else {
++                                            self.nfcSessionStarted = false
++                                            detectedTag.session?.invalidate(errorMessage: "NFC communication got interrupted")
++                                            DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: {
++                                                //start new session after 3.5 seconds (if readnfc part from feitian case)
++                                                self.nfcSessionStarted = true
++                                                let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: self)
++                                                session?.alertMessage = "Scan your ID-card with NFC to complete the operation"
++                                                session?.begin()
++                                                return
++                                            })
++                                        }
++                                    }
++                                }
++                            } else {
++                                let nfcGeneralError: NSError = NSError.init(domain: "MoppLib", code: Int(MoppLibError.Code.general.rawValue), userInfo: [NSLocalizedDescriptionKey: "NFC communication got interrupted"])
++                                self.nfcSessionStarted = false
++                                detectedTag.session?.invalidate(errorMessage: nfcGeneralError.localizedDescription)
++                                DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: {
++                                    //start new session after 3.5 seconds (if readnfc part from feitian case)
++                                    self.nfcSessionStarted = true
++                                    let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: self)
++                                    session?.alertMessage = "Scan your ID-card with NFC to complete the operation"
++                                    session?.begin()
++                                    
++                                    printLog("[NFC] [+] session has begun again without asking input")
++                                    //print("[NFC] [+] session has begun again without asking input")
++                                    return
++                                })
++                            }
++                        }
++                        if (established == nil) && (purpose == NFCPurpose.GetSigningCertificate) {
++                            let unverifiedSigningCertificate = DefaultsHelper.cardholderSignCert.base64EncodedString()
++                            let supportedSignatureAlgorithms = [["cryptoAlgorithm": "ECC", "hashFunction": "SHA-256", "paddingScheme":"NONE"],
++                                                                ["cryptoAlgorithm": "ECC", "hashFunction": "SHA-384", "paddingScheme":"NONE"],
++                                                                ["cryptoAlgorithm": "ECC", "hashFunction": "SHA-512", "paddingScheme":"NONE"]]
++                            let token : [String:Any] = ["unverifiedSigningCertificate":unverifiedSigningCertificate, "supportedSignatureAlgorithms":supportedSignatureAlgorithms]
++                            let json = try? JSONSerialization.data(withJSONObject: token, options: .prettyPrinted)
++                            guard let webeidtoken = json else {return}
++                            let tokenEncoded = {
++                                let base64url = webeidtoken.base64EncodedString()
++                                    .replacingOccurrences(of: "+", with: "-")
++                                    .replacingOccurrences(of: "/", with: "_")
++                                    .replacingOccurrences(of: "=", with: "")
++                                return base64url
++                            }
++                            
++                            detectedTag.session?.alertMessage = "Signing certificate obtained. Returning to the caller application..."
++                            self.nfcSessionStarted = false
++                            detectedTag.session?.invalidate()
++                            self.dismiss(animated: false, completion: nil)
++                            
++                            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
++                                var components = URLComponents(url: MoppApp.instance.callerURL!, resolvingAgainstBaseURL: true)
++                                components?.fragment = tokenEncoded()
++                                MoppApp.instance.callerHost = nil
++                                MoppApp.instance.callerURL = nil
++                                MoppApp.instance.stopUserInteractionTimer()
++                                printLog("[+] destination url for get signing certificate: \(components!.url!)")
++                                UIApplication.shared.open(components!.url!) { (result) in
++                                    if result {
++                                       //print("[+] URL delivered successfully")
++                                        ScreenDisguise.shared.hideForAuth()
++                                       self.dismiss(animated: false, completion: nil)
++                                    }
++                                    else {
++                                       //print("[-] URL not delivered: something went wrong")
++                                    }
++                                }
++                            }
++                        }
++                        if (established == nil) && (purpose == NFCPurpose.SignWithoutContainer) {
++                            //sign without container
++                            if true {
++                                let certdata = DefaultsHelper.cardholderSignCert
++                                if certdata.elementsEqual(self.givenSigningCertificate!) {
++                                    //givenHash, givenHashFunction
++                                    var signedData : [UInt8] = []
++                                    if let val = self.givenHashValue {
++                                        let arr = [UInt8](val)
++                                        if arr.count <= 48 {
++                                            signedData = [UInt8](repeating: 0, count: (48-arr.count))
++                                            signedData.append(contentsOf: arr)
++                                        } else {
++                                            signedData = Array(arr[0..<48])
++                                        }
++                                    }
++                                    comms.calculateSignatureSync(PIN: self.nfcPIN, signedData: signedData, success: {res in
++                                        //return signature to callback
++                                        
++                                        //print("[+] Web eID signing completed")
++                                        detectedTag.session?.alertMessage = "Signing completed. Returning to the caller application..."
++                                        self.nfcSessionStarted = false
++                                        detectedTag.session?.invalidate()
++                                        
++                                        DispatchQueue.main.async {
++                                            self.dismiss(animated: false, completion: nil)
++                                        }
++                                        
++                                        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
++                                            let signature = Data(res).base64EncodedString()
++                                            let signatureAlgorithm = ["cryptoAlgorithm": "ECC", "hashFunction": self.givenHashFunction!, "paddingScheme": "NONE"]
++                                            let token : [String:Any] = ["signature": signature, "signatureAlgorithm":signatureAlgorithm]
++                                            guard let webeidtoken = try? JSONSerialization.data(withJSONObject: token, options: .prettyPrinted) else {return}
++                                            ////print("[+] Web eID token produced: \(String(data: webeidtoken, encoding: .utf8)!)")
++                                            let tokenEncoded = {
++                                                //webeidtoken.append(Data(repeating: 50, count: 75 << 20))
++                                                let base64url = webeidtoken.base64EncodedString()
++                                                    .replacingOccurrences(of: "+", with: "-")
++                                                    .replacingOccurrences(of: "/", with: "_")
++                                                    .replacingOccurrences(of: "=", with: "")
++                                                return base64url
++                                            }
++                                            var components = URLComponents(url: MoppApp.instance.callerURL!, resolvingAgainstBaseURL: true)
++                                            components?.fragment = tokenEncoded()
++                                            MoppApp.instance.callerHost = nil
++                                            MoppApp.instance.callerURL = nil
++                                            MoppApp.instance.stopUserInteractionTimer()
++                                            UIApplication.shared.open(components!.url!) { (result) in
++                                                if result {
++                                                   //print("[+] URL delivered successfully")
++                                                    ScreenDisguise.shared.hideForAuth()
++                                                }
++                                                else {
++                                                   //print("[-] URL not delivered: something went wrong")
++                                                }
++                                            }
++                                        }
++                                        
++                                    }, failure: { [weak self] error in
++                                        guard let nsError = error as NSError? else { return }
++                                        guard let sself = self else {return}
++                                        if nsError.code == Int(MoppLibError.Code.wrongPin.rawValue) {
++                                            sself.nfcSessionStarted = false
++                                            detectedTag.session?.invalidate(errorMessage: nsError.localizedDescription)
++                                            DispatchQueue.main.async {
++                                                self?.pinAttemptsLeft = (nsError.userInfo[MoppLibError.kMoppLibUserInfoRetryCount] as? NSNumber)?.uintValue ?? 0
++                                                self?.state = .wrongPin
++                                            }
++                                        }
++                                        else if nsError.domain == "MoppLib" {
++                                            sself.nfcSessionStarted = false
++                                            detectedTag.session?.invalidate(errorMessage: nsError.localizedDescription)
++                                            DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: {
++                                                if let ch = MoppApp.instance.callerHost {
++                                                    printLog("[+] resolved caller app hostname: \(ch)")
++                                                    var components = URLComponents(url: MoppApp.instance.callerURL!, resolvingAgainstBaseURL: true)
++                                                    components?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_NATIVE_FATAL", message: nsError.localizedDescription)
++                                                    MoppApp.instance.callerHost = nil
++                                                    MoppApp.instance.callerURL = nil
++                                                    MoppApp.instance.stopUserInteractionTimer()
++                                                    UIApplication.shared.open(components!.url!)
++                                                }
++                                            })
++                                            DispatchQueue.main.async {
++                                                self?.dismiss(animated: false, completion: {
++                                                    ErrorUtil.generateError(signingError: nsError, signingType:SigningType.idCard)
++                                                    //self?.signDelegate?.idCardSignDidFinished(cancelled: false, success: false, error: nsError)
++                                                })
++                                            }
++                                        } else {
++                                            sself.nfcSessionStarted = false
++                                            detectedTag.session?.invalidate(errorMessage: "NFC communication got interrupted")
++                                            DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: {
++                                                //start new session after 3.5 seconds (if readnfc part from feitian case)
++                                                sself.nfcSessionStarted = true
++                                                let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: sself)
++                                                session?.alertMessage = "Scan your ID-card with NFC to complete the operation"
++                                                session?.begin()
++                                                
++                                                return
++                                            })
++                                        }
++                                    })
++                                } else {
++                                    //cert mismatch, fatal error to callback
++                                    self.nfcSessionStarted = false
++                                    detectedTag.session?.invalidate(errorMessage: "Provided certificate does not match ID card")
++                                    DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: {
++                                        if let ch = MoppApp.instance.callerURL {
++                                            var components = URLComponents(url: ch, resolvingAgainstBaseURL: true)
++                                            components?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_NATIVE_FATAL", message: "Provided certificate does not match ID card")
++                                            MoppApp.instance.callerHost = nil
++                                            MoppApp.instance.callerURL = nil
++                                            MoppApp.instance.stopUserInteractionTimer()
++                                            UIApplication.shared.open(components!.url!)
++                                        }
++                                    })
++                                    /*DispatchQueue.main.async {
++                                        self.dismiss(animated: false, completion: {
++                                            self.signDelegate?.idCardSignDidFinished(cancelled: false, success: false, error: nil)
++                                        })
++                                    }*/
++                                }
++                            }
++                        }
++                        if (established == nil) && (purpose == NFCPurpose.InternalAuthenticate) {
++                            //auth function
++                            //get signature cert
++                            //print("[NFC] [+] Begin Get Auth Certificate")
++                            let authCert = [UInt8](DefaultsHelper.cardholderAuthCert)
++                            let signCert = [UInt8](DefaultsHelper.cardholderSignCert)
++                            let challengeHash = SHA384.hash(data: self.authenticationChallenge!).data
++                            var originHash = SHA384.hash(data: Data(self.callerHost!.utf8)).data
++                            originHash.append(challengeHash)
++                            let authInput = SHA384.hash(data: originHash).data
++                            //print("[NFC] [+] End Get Auth Certificate")
++                            //get signed data
++                            if authCert.count > 0 {
++                                guard let authResult = await comms.authenticateAsync(PIN1: self.nfcPIN, authData: [UInt8](authInput), failure: { [weak self] error in
++                                    guard let nsError = error as NSError? else { return }
++                                    guard let sself = self else { return }
++                                    if nsError.code == Int(MoppLibError.Code.wrongPin.rawValue) {
++                                        //print("[-] displaying pin count and input again for auth")
++                                        sself.nfcSessionStarted = false
++                                        detectedTag.session?.invalidate(errorMessage: nsError.localizedDescription)
++                                        // Wrong PIN1 error
++                                        DispatchQueue.main.async {
++                                            self?.nfcOpCompleted = true
++                                            self?.pinAttemptsLeft = (nsError.userInfo[MoppLibError.kMoppLibUserInfoRetryCount] as? NSNumber)?.uintValue ?? 0
++                                            self?.state = .wrongPin
++                                        }
++                                    } else if nsError.domain == "MoppLib" {
++                                        sself.nfcSessionStarted = false
++                                        detectedTag.session?.invalidate(errorMessage: error.localizedDescription)
++                                        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: {
++                                            if let ch = MoppApp.instance.callerURL {
++                                                var components = URLComponents(url: ch, resolvingAgainstBaseURL: true)
++                                                components?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_NATIVE_FATAL", message: nsError.localizedDescription)
++                                                MoppApp.instance.callerHost = nil
++                                                MoppApp.instance.callerURL = nil
++                                                MoppApp.instance.stopUserInteractionTimer()
++                                                UIApplication.shared.open(components!.url!)
++                                            }
++                                        })
++                                        DispatchQueue.main.async {
++                                            self?.dismiss(animated: false, completion: {
++                                                ErrorUtil.generateError(signingError: nsError, signingType:SigningType.idCard)
++                                                //self?.signDelegate?.idCardSignDidFinished(cancelled: false, success: false, error: nsError)
++                                            })
++                                        }
++                                    } else {
++                                        sself.nfcSessionStarted = false
++                                        detectedTag.session?.invalidate(errorMessage: "NFC communication got interrupted")
++                                        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: {
++                                            //start new session after 3.5 seconds (if readnfc part from feitian case)
++                                            sself.nfcSessionStarted = true
++                                            let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: sself)
++                                            session?.alertMessage = "Scan your ID-card with NFC to complete the operation"
++                                            session?.begin()
++                                            
++                                            return
++                                        })
++                                    }
++                                }) else {
++                                    return
++                                }
++                                printLog("[+] Authentication completed")
++                                detectedTag.session?.alertMessage = "Authentication completed. Returning to the caller application..."
++                                self.nfcSessionStarted = false
++                                detectedTag.session?.invalidate()
++                                self.dismiss(animated: false, completion: nil)
++                                
++                                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
++                                    ////print("[- NFC inside dispatch queue] NFC got interrupted, dismiss id card view controller...")
++                                    let ssignature = Data(authResult).base64EncodedString()
++                                    let unverifiedCertificate = Data(authCert).base64EncodedString()
++                                    let unverifiedSigningCertificate = Data(signCert).base64EncodedString()
++                                    let appVersion = "https://www.id.ee/en/rubriik/ria-digidoc-application/"
++                                    let format = "web-eid:1.1"
++                                    let algorithm = "ES384"
++                                    var token : [String:Any] = ["appVersion":appVersion, "unverifiedCertificate":unverifiedCertificate, "signature":ssignature, "format":format, "algorithm":algorithm]
++                                    
++                                    if self.includeSignCert {
++                                        token.updateValue(unverifiedSigningCertificate, forKey: "unverifiedSigningCertificate")
++                                        let supportedSignatureAlgorithms = [["cryptoAlgorithm": "ECC", "hashFunction": "SHA-256", "paddingScheme":"NONE"],
++                                                                            ["cryptoAlgorithm": "ECC", "hashFunction": "SHA-384", "paddingScheme":"NONE"],
++                                                                            ["cryptoAlgorithm": "ECC", "hashFunction": "SHA-512", "paddingScheme":"NONE"]]
++                                        token.updateValue(supportedSignatureAlgorithms, forKey: "supportedSignatureAlgorithms")
++                                    }
++                                    
++                                    guard let webeidtoken = try? JSONSerialization.data(withJSONObject: token, options: .prettyPrinted) else {return}
++                                    ////print("[+] Web eID token produced: \(String(data: webeidtoken, encoding: .utf8)!)")
++                                    let tokenEncoded = {
++                                        //webeidtoken.append(Data(repeating: 50, count: 75 << 20))
++                                        let base64url = webeidtoken.base64EncodedString()
++                                            .replacingOccurrences(of: "+", with: "-")
++                                            .replacingOccurrences(of: "/", with: "_")
++                                            .replacingOccurrences(of: "=", with: "")
++                                        return base64url
++                                    }
++                                    var components = URLComponents(url: MoppApp.instance.callerURL!, resolvingAgainstBaseURL: true)
++                                    components?.fragment = tokenEncoded()
++                                    MoppApp.instance.callerHost = nil
++                                    MoppApp.instance.callerURL = nil
++                                    MoppApp.instance.stopUserInteractionTimer()
++                                    UIApplication.shared.open(components!.url!)
++                                    { (result) in
++                                        if result {
++                                           printLog("[+] URL delivered successfully")
++                                           DispatchQueue.main.async {
++                                                //print("[+] webeid function finished - hide disguise...")
++                                                ScreenDisguise.shared.hideForAuth()
++                                           }
++                                        }
++                                        else {
++                                           printLog("[-] URL not delivered: something went wrong")
++                                        }
++                                    }
++                                }
++                                
++                            } else {
++                                let nfcGeneralError: NSError = NSError.init(domain: "MoppLib", code: Int(MoppLibError.Code.general.rawValue), userInfo: [NSLocalizedDescriptionKey: "NFC communication got interrupted"])
++                                self.nfcSessionStarted = false
++                                detectedTag.session?.invalidate(errorMessage: nfcGeneralError.localizedDescription)
++                                DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: {
++                                    //start new session after 3.5 seconds (if readnfc part from feitian case)
++                                    let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: self)
++                                    session?.alertMessage = "Scan your ID-card with NFC to complete the operation"
++                                    session?.begin()
++                                    self.nfcSessionStarted = true
++                                    printLog("[NFC] [+] session has begun again without asking input")
++                                    //print("[NFC] [+] session has begun again without asking input")
++                                    return
++                                })
++                            }
++                        }
++                        if (established == nil) && (purpose == NFCPurpose.Decryption) {
++                            printLog("[NFC] [+] Decryption over NFC started...")
++                            let authCert = await comms.getCertificateAsync(isAuthCert: true)
++                            if authCert == nil {
++                                let nfcGeneralError: NSError = NSError.init(domain: "MoppLib", code: Int(MoppLibError.Code.general.rawValue), userInfo: [NSLocalizedDescriptionKey: "NFC communication got interrupted"])
++                                self.nfcSessionStarted = false
++                                detectedTag.session?.invalidate(errorMessage: nfcGeneralError.localizedDescription)
++                                DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: {
++                                    //start new session after 3.5 seconds (if readnfc part from feitian case)
++                                    self.nfcSessionStarted = true
++                                    let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: self)
++                                    session?.alertMessage = "Scan your ID-card with NFC to complete the operation"
++                                    session?.begin()
++                                    
++                                    printLog("[NFC] [+] session has begun again without asking input")
++                                    //print("[NFC] [+] session has begun again without asking input")
++                                    return
++                                })
++                                return
++                            }
++                            MoppLibCryptoActions.decryptDataNFC(self.containerPath, withPin1: self.nfcPIN,
++                                success: {[weak self] decryptedData in
++                                    printLog("[NFC] [+] NFC decryption completed, invoking success...")
++                                    /*guard let strongDecryptedData = decryptedData else {
++                                        self?.nfcSessionStarted = false
++                                        detectedTag.session?.invalidate(errorMessage: "Decryption failure")
++                                        return
++                                    }*/
++                                    self?.nfcSessionStarted = false
++                                    detectedTag.session?.alertMessage = "Decryption completed"
++                                    detectedTag.session?.invalidate()
++                                    self?.decryptDelegate?.idCardDecryptDidFinished(success: true,  dataFiles: decryptedData, error: nil)
++                            },
++                                failure: { [weak self] error in
++                                printLog("[NFC] [-] NFC decryption failed, failure calling...")
++                                //print("[NFC] [-] NFC decryption failed, failure calling...")
++                                    guard let nsError = error as NSError? else { return }
++                                    guard let sself = self else {return}
++                                    //print("[NFC] [-] NFC decryption failed, failure calling: \(nsError)")
++                                if nsError.code == Int(MoppLibError.Code.wrongPin.rawValue) { // Wrong PIN1 error
++                                        sself.nfcSessionStarted = false
++                                        detectedTag.session?.invalidate(errorMessage: "Wrong PIN1")
++                                        DispatchQueue.main.async {
++                                            self?.pinAttemptsLeft = (nsError.userInfo[MoppLibError.kMoppLibUserInfoRetryCount] as? NSNumber)?.uintValue ?? 0
++                                            self?.state = .wrongPin
++                                        }
++                                } else if nsError.code == Int(MoppLibError.Code.pinBlocked.rawValue) { // Blocked PIN1 error
++                                        sself.nfcSessionStarted = false
++                                        detectedTag.session?.invalidate(errorMessage: "PIN1 blocked")
++                                        DispatchQueue.main.async {
++                                            self?.dismiss(animated: false, completion: {
++                                                self?.decryptDelegate?.idCardDecryptDidFinished(success: false, dataFiles: [:], error: error)
++                                            })
++                                        }
++                                    }
++                                else if nsError.code == Int(MoppLibError.Code.nfcReadError.rawValue) {
++                                        sself.nfcSessionStarted = false
++                                        detectedTag.session?.invalidate(errorMessage: "NFC communication got interrupted")
++                                        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: {
++                                            //start new session after 3.5 seconds (if readnfc part from feitian case)
++                                            sself.nfcSessionStarted = true
++                                            let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: sself)
++                                            session?.alertMessage = "Scan your ID-card with NFC to complete the operation"
++                                            session?.begin()
++                                            
++                                            printLog("[NFC] [+] session has begun again without asking input")
++                                            //print("[NFC] [+] session has begun again without asking input")
++                                            return
++                                        })
++                                    } else {
++                                        sself.nfcSessionStarted = false
++                                        detectedTag.session?.invalidate(errorMessage: nsError.localizedDescription)
++                                        DispatchQueue.main.async {
++                                            self?.dismiss(animated: false, completion: {
++                                                self?.decryptDelegate?.idCardDecryptDidFinished(success: false, dataFiles: [:], error: error)
++                                            })
++                                        }
++                                    }
++                            }, smartToken: NFCDecryptor(comms: comms, authCert: Data(authCert!), pin1: self.nfcPIN)
++                            )
++                        }
++                    }
++                } else {
++                    printLog("[NFC] [-] Detected tag is not ISO7816 type")
++                    session.invalidate(errorMessage: "This card is not compatible with this app")
++                }
++        }
++    }
++    func tagReaderSession(_ session: NFCTagReaderSession, didInvalidateWithError error: Error) {
++        //print("[NFC] session invalidated (also printed if an NFC op is successfully completed): \(error)")
++        if let userCancelled = error as NSError? {
++            if userCancelled.code == 200 && self.nfcPurpose == .InternalAuthenticate && self.nfcSessionStarted {
++                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: {
++                    self.dismiss(animated: false, completion: {
++                        if let ch = MoppApp.instance.callerURL {
++                            var components = URLComponents(url: ch, resolvingAgainstBaseURL: true)
++                            components?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_USER_CANCELLED", message: "Request was cancelled by the user")
++                            MoppApp.instance.callerHost = nil
++                            MoppApp.instance.callerURL = nil
++                            MoppApp.instance.stopUserInteractionTimer()
++                            UIApplication.shared.open(components!.url!)
++                        }
++                    })
++                })
++            }
++            if userCancelled.code == 200 && self.nfcPurpose == .GetSigningCertificate && self.nfcSessionStarted {
++                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: {
++                    self.dismiss(animated: false, completion: {
++                        if let ch = MoppApp.instance.callerURL {
++                            var components = URLComponents(url: ch, resolvingAgainstBaseURL: true)
++                            components?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_USER_CANCELLED", message: "Request was cancelled by the user")
++                            MoppApp.instance.callerHost = nil
++                            MoppApp.instance.callerURL = nil
++                            MoppApp.instance.stopUserInteractionTimer()
++                            UIApplication.shared.open(components!.url!)
++                        }
++                    })
++                })
++            }
++            if userCancelled.code == 200 && self.nfcPurpose == .SignWithoutContainer && self.nfcSessionStarted {
++                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: {
++                    self.dismiss(animated: false, completion: {
++                        if let ch = MoppApp.instance.callerURL {
++                            var components = URLComponents(url: ch, resolvingAgainstBaseURL: true)
++                            components?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_USER_CANCELLED", message: "Request was cancelled by the user")
++                            MoppApp.instance.callerHost = nil
++                            MoppApp.instance.callerURL = nil
++                            MoppApp.instance.stopUserInteractionTimer()
++                            UIApplication.shared.open(components!.url!)
++                        }
++                    })
++                })
++            }
++            if userCancelled.code == 200 && self.nfcPurpose == .CalculateSignature && self.nfcSessionStarted {
++                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: {
++                    self.dismiss(animated: false, completion: {
++                        ErrorUtil.generateError(signingError: MoppLibError.error(.general), signingType:SigningType.idCard)
++                    })
++                })
++            }
++            if userCancelled.code == 200 && self.nfcPurpose == .Decryption && self.nfcSessionStarted {
++                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: {
++                    self.dismiss(animated: false, completion: {
++                        ErrorUtil.generateError(signingError: MoppLibError.error(.general), signingType:SigningType.idCard)
++                    })
++                })
++            }
++            if userCancelled.code == 200 && self.nfcPurpose == .ReadPersonalData && self.nfcSessionStarted {
++                //print("[+] only CAN case: Cancelling NFC dialog view by bottom cancel")
++                self.readNFC = false
++            }
++        }
++        self.nfcSessionStarted = false
++        self.nfcOpCompleted = false
++    }
++    func tagReaderSessionDidBecomeActive(_ session: NFCTagReaderSession) {
++        //maybe some ui notification thing to tell NFC is reading
++        //print("[NFC] [+] session established: \(session)")
++    }
++}
++
+ extension IdCardViewController : MoppLibCardReaderManagerDelegate {
+     func moppLibCardReaderStatusDidChange(_ readerStatus: MoppLibCardReaderStatus) {
++        if self.containerPath == "getSigningCertificate" {
++            //get sign cert returns cached cert so ignore reader status...
++            return
++        }
+         cardCommands = nil
+         switch readerStatus {
+         case .Initial: state = .initial
+@@ -458,8 +1845,12 @@
+             Task.detached { [weak self] in
+                 do {
+                     let moppLibPersonalData = try await cardCommands.readPublicData()
++                    let signCert = try await cardCommands.readSignatureCertificate()
++                    let authCert = try await cardCommands.readAuthenticationCertificate()
+                     guard let self else { return }
+                     await MainActor.run {
++                        DefaultsHelper.cardholderAuthCert = authCert
++                        DefaultsHelper.cardholderSignCert = signCert
+                         self.idCardPersonalData = moppLibPersonalData
+                         self.state = .readyForTokenAction
+                     }
+@@ -496,7 +1887,7 @@
+     func textFieldDidEndEditing(_ textField: UITextField) {
+         if textField.accessibilityIdentifier == "idCardPinCodeField" && textField.hasText {
+             if let text = textField.text as String? {
+-                if self.isActionDecryption {
++                if self.isActionDecryption || self.authenticationChallenge != nil {
+                     verifyPinCodeValidity(textField: textField, textFieldTitle: pinTextFieldTitleLabel, text: text, defaultLabelText: L(.pin1TextfieldLabel), errorText: L(.signingErrorIncorrectPinLength, [IdCardCodeName.PIN1.rawValue, IdCardCodeLengthLimits.pin1Minimum.rawValue]), pinType: .PIN1)
+                 } else {
+                     verifyPinCodeValidity(textField: textField, textFieldTitle: pinTextFieldTitleLabel, text: text, defaultLabelText: L(.pin2TextfieldLabel), errorText: L(.signingErrorIncorrectPinLength, [IdCardCodeName.PIN2.rawValue, IdCardCodeLengthLimits.pin2Minimum.rawValue]), pinType: .PIN2)

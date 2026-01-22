@@ -1,0 +1,900 @@
+--- MoppApp.swift	2025-07-14 05:01:06
++++ MoppApp2.swift	2025-08-08 15:16:01
+@@ -38,6 +38,30 @@
+     var documentFormat:String = ""
+     var downloadTask: URLSessionTask?
+     var isInvalidFileInList: Bool = false
++    
++    // Variables for DigiDoc NFC Beta
++    var authenticationViewController: TokenFlowSelectionViewController?
++    var getSigningCertificateViewController: TokenFlowSelectionViewController?
++    var signingViewController: TokenFlowSelectionViewController?
++    var callerHost: String?
++    var callerURL: URL?
++    var callerSigningIdentifier: Data?
++    var callerAuthIdentifier: Data?
++    var isWebEIDrequest: Bool = false
++    var isAppRequestedSignature = false
++    var sendingAppID: Any?
++    var appRequestedError : String?
++    
++    enum WebEIDRequest {
++        case None
++        case Authenticate
++        case GetSigningCertificate
++        case Sign
++    }
++    
++    var userInteractionTimer: Timer? = nil
++    var webEIDrequest = WebEIDRequest.None
++    //
+ 
+     var rootViewController: UIViewController? {
+         return window?.rootViewController
+@@ -88,6 +112,8 @@
+         // Log console logs to a file in Library/Cache/logs folder
+         if isUsingTestMode() || (FileLogUtil.isLoggingEnabled() && FileLogUtil.isLoggingRunning()) {
+             setDebugMode(value: true)
++            
++            //this does not print logs to the console
+             FileLogUtil.logToFile()
+         } else {
+             setDebugMode(value: false)
+@@ -161,7 +187,6 @@
+             let initializationViewController = InitializationViewController()
+             window?.rootViewController = initializationViewController
+         }
+-
+         window?.makeKeyAndVisible()
+         return true
+     }
+@@ -180,10 +205,37 @@
+         if !sharedFiles.isEmpty {
+            handleSharedFiles(sharedFiles: sharedFiles)
+         } else {
+-            if let tempUrl = self.tempUrl {
+-                _ = openUrl(url: tempUrl, options: [:])
+-                self.tempUrl = nil
++            if let err = self.appRequestedError {
++                //title: L(.errorAlertTitleGeneral),
++                landingViewController?.showErrorMessage(message: err)
+             }
++            else if let tempUrl = self.tempUrl {
++                if isWebEIDrequest {
++                    self.isWebEIDrequest = false
++                    printLog("[+] presenting web eid request...")
++                    //present get sign cert or signing controllers too...
++                    if webEIDrequest == .Authenticate {
++                        printLog("[+] display webeid authenticate request...")
++                        landingViewController?.present(self.authenticationViewController!, animated: true)
++                    }
++                    else if webEIDrequest == .GetSigningCertificate {
++                        printLog("[+] display webeid get signing certificate request...")
++                        landingViewController?.present(self.getSigningCertificateViewController!, animated: true)
++                    }
++                    else if webEIDrequest == .Sign {
++                        printLog("[+] display webeid sign request...")
++                        landingViewController?.present(self.signingViewController!, animated: true)
++                    }
++                }
++                else {
++                    if tempUrl.scheme == "webeid" {
++                        printLog("[+] avoid processing app-request schemes again...")
++                        return
++                    }
++                    _ = openUrl(url: tempUrl, options: [:])
++                    self.tempUrl = nil
++                }
++            }
+         }
+         if Crashlytics.crashlytics().didCrashDuringPreviousExecution() {
+             if (DefaultsHelper.crashReportSetting != CrashlyticsAlwaysSend) {
+@@ -222,6 +274,26 @@
+     func openUrl(url: URL, options: [UIApplication.OpenURLOptionsKey : Any] = [:]) -> Bool {
+         return openPath(urls: [url], options: options)
+     }
++    
++    func encodedAppRequestedError(code: String, message: String) -> String {
++        let token = ["error": ["code":code, "message":message]]
++        guard let webeidtoken = try? JSONSerialization.data(withJSONObject: token, options: .prettyPrinted) else {
++            //print("[-] cannot convert dictionary to JSON string, returning empty string...")
++            return ""
++        }
++        let base64url = webeidtoken.base64EncodedString()
++                .replacingOccurrences(of: "+", with: "-")
++                .replacingOccurrences(of: "/", with: "_")
++                .replacingOccurrences(of: "=", with: "")
++        return base64url
++    }
++    
++    func stopUserInteractionTimer() {
++        if userInteractionTimer != nil {
++            userInteractionTimer?.invalidate()
++            userInteractionTimer = nil
++        }
++    }
+ 
+     func openPath(urls: [URL], options: [UIApplication.OpenURLOptionsKey : Any] = [:]) -> Bool {
+         guard !urls.isEmpty else {
+@@ -240,6 +312,756 @@
+                 
+                 var fileUrl: URL = url
+                 
++                //Handling links
++                var acsFragment = ""
++                if url.host == "acs.cs.ut.ee", let f = url.fragment {
++                    acsFragment = f
++                }
++                
++                if url.scheme == "webeid" || acsFragment != "" {
++                    var components = URLComponents(url: fileUrl, resolvingAgainstBaseURL: false)
++                    if acsFragment != "" {
++                        let uriStr = "webeid://"+acsFragment
++                        let acsUrl = URL(string: uriStr)
++                        components = URLComponents(url: acsUrl!, resolvingAgainstBaseURL: false)
++                    }
++                    let isLandingViewNil = landingViewController == nil
++                    if components == nil || components!.queryItems == nil || components!.queryItems!.isEmpty || components!.host == nil {
++                        //put or cases separately, if host is not nil, return error to caller. if host is nil, same as usual.
++                        if isLandingViewNil {
++                            self.appRequestedError = L(.authRequestError)
++                        } else {
++                            DispatchQueue.main.async {
++                                //title: L(.errorAlertTitleGeneral),
++                                topViewController.showErrorMessage(message: L(.authRequestError))
++                                self.appRequestedError = nil
++                            }
++                        }
++                        self.isWebEIDrequest = false
++                        webEIDrequest = .None
++                        tempUrl = nil
++                        return true
++                    }
++                    let targetFunc = components!.host!
++                    if targetFunc == "authenticate" {
++                        self.isWebEIDrequest = true
++                        self.webEIDrequest = .Authenticate
++                        if isLandingViewNil {
++                            printLog("[+] landing view controller is not ready yet...")
++                            tempUrl = fileUrl
++                        }
++                        //printLog("[+] Handle authentication from here = App already open situation"
++                        //let authIdentifier = components?.queryItems?.first(where: {$0.name == "auth_id"})?.value
++                        let challenge = components?.queryItems?.first(where: {$0.name == "challengeNonce"})?.value
++                        let lang = components?.queryItems?.first(where: {$0.name == "lang"})?.value
++                        let userInteractionTimeout = components?.queryItems?.first(where: {$0.name == "userInteractionTimeout"})?.value
++                        let getSigningCert = components?.queryItems?.first(where: {$0.name == "getSigningCertificate"})?.value
++                        let callbackURL = components?.queryItems?.first(where: {$0.name == "callbackUrl"})?.value
++                        
++                        ////print("[query items] \(components!.queryItems!)")
++                        ////print("[callback url] \(callbackURL!)")
++                        
++                        if callbackURL.isNilOrEmpty {
++                            if isLandingViewNil {
++                                self.appRequestedError = L(.callbackUrlInvalid)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.callbackUrlInvalid))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        let callback = callbackURL!.removingPercentEncoding
++                        let callback_url = URL(string: callback!)
++                        //later: write a different error message for this case
++                        if callback_url == nil || callback_url?.scheme == nil || callback_url?.scheme != "https" {
++                            if isLandingViewNil {
++                                self.appRequestedError = L(.callbackUrlInvalid)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.callbackUrlInvalid))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        //print("[callback url] \(callback_url!)")
++                        
++                        //if timeout is received, schedule timer to invoke leaving app with error message but if app returns result, invalidate timer
++                        if let timeout = userInteractionTimeout {
++                            if let interval = Int(timeout), interval > 0 {
++                                let intervalValue = Double(interval) / 1000
++                                userInteractionTimer = Timer.scheduledTimer(withTimeInterval: intervalValue, repeats: false, block: { [weak self]_ in
++                                    DispatchQueue.main.async {
++                                        var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                                        comps?.fragment = self?.encodedAppRequestedError(code: "ERR_WEBEID_USER_TIMEOUT", message: "User interaction timed out")
++                                        UIApplication.shared.open(comps!.url!)
++                                        if isLandingViewNil {
++                                            self?.appRequestedError = L(.webeidUserTimeout)
++                                        } else {
++                                            DispatchQueue.main.async {
++                                                //title: L(.errorAlertTitleGeneral),
++                                                topViewController.showErrorMessage(message: L(.webeidUserTimeout))
++                                                self?.appRequestedError = nil
++                                            }
++                                        }
++                                        self?.isWebEIDrequest = false
++                                        self?.webEIDrequest = .None
++                                        self?.tempUrl = nil
++                                    }
++                                })
++                            } else {
++                                var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                                comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_INVALID_ARGUMENT", message: "webeid scheme requires a valid 'userInteractionTimeout' query parameter")
++                                stopUserInteractionTimer()
++                                UIApplication.shared.open(comps!.url!)
++                                if isLandingViewNil {
++                                    //TODO: change authChallengeError to userTimeoutInvalidError
++                                    self.appRequestedError = L(.webeidUserTimeoutInvalid)
++                                } else {
++                                    DispatchQueue.main.async {
++                                        //title: L(.errorAlertTitleGeneral),
++                                        topViewController.showErrorMessage(message: L(.webeidUserTimeoutInvalid))
++                                        self.appRequestedError = nil
++                                    }
++                                }
++                                self.isWebEIDrequest = false
++                                webEIDrequest = .None
++                                tempUrl = nil
++                                return true
++                            }
++                        }
++                        
++                        let allowedLangs = ["et","en","ru"]
++                        // do not change language for now because I have no translation for et and ru...
++                        if lang != nil && (lang!.count != 2 || allowedLangs.firstIndex(of: lang!) == nil) {
++                            var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_INVALID_ARGUMENT", message: "webeid scheme requires a valid 'lang' query parameter")
++                            stopUserInteractionTimer()
++                            UIApplication.shared.open(comps!.url!)
++                            if isLandingViewNil {
++                                //TODO: change authChallengeError to langInvalidError
++                                self.appRequestedError = L(.langInvalidError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.langInvalidError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        if challenge.isNilOrEmpty {
++                            var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_MISSING_PARAMETER", message: "webeid scheme requires 'challenge' query parameter")
++                            stopUserInteractionTimer()
++                            UIApplication.shared.open(comps!.url!)
++                            if isLandingViewNil {
++                                self.appRequestedError = L(.authChallengeError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.authChallengeError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        let challengeBytes = {
++                            var base64 = challenge!
++                                .replacingOccurrences(of: "-", with: "+")
++                                .replacingOccurrences(of: "_", with: "/")
++                            if base64.count % 4 != 0 {
++                                base64.append(String(repeating: "=", count: 4 - base64.count % 4))
++                            }
++                            return base64
++                        }
++                        
++                        let authChallenge = Data(base64Encoded: challengeBytes())
++                        
++                        if authChallenge == nil {
++                            var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_INVALID_ARGUMENT", message: "webeidauth scheme requires 'challenge' query parameter to be Base64URL encoded")
++                            stopUserInteractionTimer()
++                            UIApplication.shared.open(comps!.url!)
++                            if isLandingViewNil {
++                                self.appRequestedError = L(.authChallengeError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.authChallengeError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        if authChallenge!.count < 32 {
++                            var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_INVALID_ARGUMENT", message: "webeidauth scheme requires 'challenge' query parameter to be at least 32 bytes decoded length")
++                            stopUserInteractionTimer()
++                            UIApplication.shared.open(comps!.url!)
++                            if isLandingViewNil {
++                                self.appRequestedError = L(.authChallengeLengthError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.authChallengeLengthError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        if authChallenge!.count >= 32 {
++                            printLog("[+] setting isAuthentication true again, creating authentication view controller...")
++                            self.isWebEIDrequest = true
++                            self.webEIDrequest = .Authenticate
++                            self.callerHost = callback_url!.scheme! + "://" + callback_url!.host!
++                            //print("[+] webeid origin: \(self.callerHost!)")
++                            self.callerURL = callback_url!
++                            self.authenticationViewController = UIStoryboard.tokenFlow.instantiateViewController(of: TokenFlowSelectionViewController.self)
++                            //printLog("[+] TokenFlow VC initialized = App already open situation")
++                            self.authenticationViewController!.modalPresentationStyle = .overFullScreen
++                            self.authenticationViewController!.mobileIdEditViewControllerDelegate = nil
++                            self.authenticationViewController!.smartIdEditViewControllerDelegate = nil
++                            //self.authenticationViewController!.idCardSignViewControllerDelegate = nil
++                            self.authenticationViewController!.containerPath = "authenticate"
++                            self.authenticationViewController!.authenticationChallenge = authChallenge
++                            self.authenticationViewController!.callerHost = self.callerHost
++                            if let includeSignCert = getSigningCert {
++                                if includeSignCert == "true" {
++                                    self.authenticationViewController!.includeSignCert = true
++                                }
++                            }
++                            
++                            if landingViewController != nil {
++                                //print("[+] presenting authentication request...")
++                                //print("[+] top view for authentication: \(topViewController)")
++                                topViewController.present(self.authenticationViewController!, animated: true)
++                            }
++                            
++                            return true
++                        }
++                        return true
++                    }
++                    //follows sign and getSigningCertificate
++                    else if targetFunc == "getSigningCertificate" {
++                        if isLandingViewNil {
++                            printLog("[+] landing view controller is not ready yet...")
++                            tempUrl = fileUrl
++                        }
++                        let lang = components?.queryItems?.first(where: {$0.name == "lang"})?.value
++                        let userInteractionTimeout = components?.queryItems?.first(where: {$0.name == "userInteractionTimeout"})?.value
++                        let callbackURL = components?.queryItems?.first(where: {$0.name == "callbackUrl"})?.value
++                        
++                        if callbackURL.isNilOrEmpty {
++                            if isLandingViewNil {
++                                self.appRequestedError = L(.callbackUrlError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.callbackUrlError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        let callback = callbackURL!.removingPercentEncoding
++                        let callback_url = URL(string: callback!)
++                        //later: write a different error message for this case
++                        if callback_url == nil || callback_url?.scheme == nil || callback_url?.scheme != "https" {
++                            if isLandingViewNil {
++                                self.appRequestedError = L(.callbackUrlInvalid)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.callbackUrlInvalid))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        //if timeout is received, schedule timer to invoke leaving app with error message but if app returns result, invalidate timer
++                        if let timeout = userInteractionTimeout {
++                            if let interval = Int(timeout), interval > 0 {
++                                let intervalValue = Double(interval) / 1000
++                                userInteractionTimer = Timer.scheduledTimer(withTimeInterval: intervalValue, repeats: false, block: { [weak self]_ in
++                                    DispatchQueue.main.async {
++                                        var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                                        comps?.fragment = self?.encodedAppRequestedError(code: "ERR_WEBEID_USER_TIMEOUT", message: "User interaction timed out")
++                                        UIApplication.shared.open(comps!.url!)
++                                        if isLandingViewNil {
++                                            self?.appRequestedError = L(.webeidUserTimeout)
++                                        } else {
++                                            DispatchQueue.main.async {
++                                                //title: L(.errorAlertTitleGeneral),
++                                                topViewController.showErrorMessage(message: L(.webeidUserTimeout))
++                                                self?.appRequestedError = nil
++                                            }
++                                        }
++                                        self?.isWebEIDrequest = false
++                                        self?.webEIDrequest = .None
++                                        self?.tempUrl = nil
++                                    }
++                                })
++                            } else {
++                                var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                                comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_INVALID_ARGUMENT", message: "webeid scheme requires a valid 'userInteractionTimeout' query parameter")
++                                stopUserInteractionTimer()
++                                UIApplication.shared.open(comps!.url!)
++                                if isLandingViewNil {
++                                    //TODO: change authChallengeError to userTimeoutInvalidError
++                                    self.appRequestedError = L(.webeidUserTimeoutInvalid)
++                                } else {
++                                    DispatchQueue.main.async {
++                                        //title: L(.errorAlertTitleGeneral),
++                                        topViewController.showErrorMessage(message: L(.webeidUserTimeoutInvalid))
++                                        self.appRequestedError = nil
++                                    }
++                                }
++                                self.isWebEIDrequest = false
++                                webEIDrequest = .None
++                                tempUrl = nil
++                                return true
++                            }
++                        }
++                        
++                        let allowedLangs = ["et","en","ru"]
++                        // do not change language for now because I have no translation for et and ru...
++                        if lang != nil && (lang!.count != 2 || allowedLangs.firstIndex(of: lang!) == nil) {
++                            var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_INVALID_ARGUMENT", message: "webeid scheme requires a valid 'lang' query parameter")
++                            stopUserInteractionTimer()
++                            UIApplication.shared.open(comps!.url!)
++                            if isLandingViewNil {
++                                //TODO: change authChallengeError to langInvalidError
++                                self.appRequestedError = L(.langInvalidError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.langInvalidError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        printLog("[+] creating get signing certificate view controller...")
++                        self.isWebEIDrequest = true
++                        self.webEIDrequest = .GetSigningCertificate
++                        self.callerHost = callback_url!.scheme! + "://" + callback_url!.host!
++                        self.callerURL = callback_url!
++                        self.getSigningCertificateViewController = UIStoryboard.tokenFlow.instantiateViewController(of: TokenFlowSelectionViewController.self)
++                        //printLog("[+] TokenFlow VC initialized = App already open situation")
++                        self.getSigningCertificateViewController!.modalPresentationStyle = .overFullScreen
++                        self.getSigningCertificateViewController!.mobileIdEditViewControllerDelegate = nil
++                        self.getSigningCertificateViewController!.smartIdEditViewControllerDelegate = nil
++                        //self.getSigningCertificateViewController!.idCardSignViewControllerDelegate = nil
++                        self.getSigningCertificateViewController!.containerPath = "getSigningCertificate"
++                        self.getSigningCertificateViewController!.callerHost = self.callerHost
++                        
++                        if landingViewController != nil {
++                            //print("[+] presenting signing certificate request...")
++                            //print("[+] top view for getting signing certificate: \(topViewController)")
++                            topViewController.present(self.getSigningCertificateViewController!, animated: true)
++                        }
++                        
++                        return true
++                        
++                    }
++                    else if targetFunc == "sign" {
++                        //validate parameters and pass to token view controller (not displaying container)
++                        if isLandingViewNil {
++                            printLog("[+] landing view controller is not ready yet...")
++                            tempUrl = fileUrl
++                        }
++                        let lang = components?.queryItems?.first(where: {$0.name == "lang"})?.value
++                        let userInteractionTimeout = components?.queryItems?.first(where: {$0.name == "userInteractionTimeout"})?.value
++                        let callbackURL = components?.queryItems?.first(where: {$0.name == "callbackUrl"})?.value
++                        let certificate = components?.queryItems?.first(where: {$0.name == "certificate"})?.value
++                        let hash = components?.queryItems?.first(where: {$0.name == "hash"})?.value
++                        let hashFunction = components?.queryItems?.first(where: {$0.name == "hashFunction"})?.value
++                        
++                        if callbackURL.isNilOrEmpty {
++                            if isLandingViewNil {
++                                self.appRequestedError = L(.callbackUrlError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.callbackUrlError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        let callback = callbackURL!.removingPercentEncoding
++                        let callback_url = URL(string: callback!)
++                        //later: write a different error message for this case
++                        if callback_url == nil || callback_url?.scheme == nil || callback_url?.scheme != "https" {
++                            if isLandingViewNil {
++                                self.appRequestedError = L(.callbackUrlInvalid)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.callbackUrlInvalid))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        //if timeout is received, schedule timer to invoke leaving app with error message but if app returns result, invalidate timer
++                        if let timeout = userInteractionTimeout {
++                            if let interval = Int(timeout), interval > 0 {
++                                let intervalValue = Double(interval) / 1000
++                                userInteractionTimer = Timer.scheduledTimer(withTimeInterval: intervalValue, repeats: false, block: { [weak self]_ in
++                                    DispatchQueue.main.async {
++                                        var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                                        comps?.fragment = self?.encodedAppRequestedError(code: "ERR_WEBEID_USER_TIMEOUT", message: "User interaction timed out")
++                                        UIApplication.shared.open(comps!.url!)
++                                        if isLandingViewNil {
++                                            self?.appRequestedError = L(.webeidUserTimeout)
++                                        } else {
++                                            DispatchQueue.main.async {
++                                                //title: L(.errorAlertTitleGeneral),
++                                                topViewController.showErrorMessage(message: L(.webeidUserTimeout))
++                                                self?.appRequestedError = nil
++                                            }
++                                        }
++                                        self?.isWebEIDrequest = false
++                                        self?.webEIDrequest = .None
++                                        self?.tempUrl = nil
++                                    }
++                                })
++                            } else {
++                                var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                                comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_INVALID_ARGUMENT", message: "webeid scheme requires a valid 'userInteractionTimeout' query parameter")
++                                stopUserInteractionTimer()
++                                UIApplication.shared.open(comps!.url!)
++                                if isLandingViewNil {
++                                    //TODO: change authChallengeError to userTimeoutInvalidError
++                                    self.appRequestedError = L(.webeidUserTimeoutInvalid)
++                                } else {
++                                    DispatchQueue.main.async {
++                                        //title: L(.errorAlertTitleGeneral),
++                                        topViewController.showErrorMessage(message: L(.webeidUserTimeoutInvalid))
++                                        self.appRequestedError = nil
++                                    }
++                                }
++                                self.isWebEIDrequest = false
++                                webEIDrequest = .None
++                                tempUrl = nil
++                                return true
++                            }
++                        }
++                        
++                        let allowedLangs = ["et","en","ru"]
++                        // do not change language for now because I have no translation for et and ru...
++                        if lang != nil && (lang!.count != 2 || allowedLangs.firstIndex(of: lang!) == nil) {
++                            var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_INVALID_ARGUMENT", message: "webeid scheme requires a valid 'lang' query parameter")
++                            stopUserInteractionTimer()
++                            UIApplication.shared.open(comps!.url!)
++                            if isLandingViewNil {
++                                //TODO: change authChallengeError to langInvalidError
++                                self.appRequestedError = L(.langInvalidError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.langInvalidError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        if certificate.isNilOrEmpty {
++                            var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_MISSING_PARAMETER", message: "webeid scheme requires 'certificate' query parameter")
++                            stopUserInteractionTimer()
++                            UIApplication.shared.open(comps!.url!)
++                            if isLandingViewNil {
++                                //TODO: change authChallengeError to missingCertificateError
++                                self.appRequestedError = L(.missingCertificateError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.missingCertificateError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        if hash.isNilOrEmpty {
++                            var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_MISSING_PARAMETER", message: "webeid scheme requires 'hash' query parameter")
++                            stopUserInteractionTimer()
++                            UIApplication.shared.open(comps!.url!)
++                            if isLandingViewNil {
++                                //TODO: change authChallengeError to missingHashError
++                                self.appRequestedError = L(.missingHashError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.missingHashError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        if hashFunction.isNilOrEmpty {
++                            var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_MISSING_PARAMETER", message: "webeid scheme requires 'hashFunction' query parameter")
++                            stopUserInteractionTimer()
++                            UIApplication.shared.open(comps!.url!)
++                            if isLandingViewNil {
++                                //TODO: change authChallengeError to missingHashFunctionError
++                                self.appRequestedError = L(.missingHashFunctionError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.missingHashFunctionError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        let hashFunc = hashFunction!
++                        
++                        if hashFunc.count > 8 {
++                            var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_INVALID_ARGUMENT", message: "webeid scheme requires a valid 'hashFunction' query parameter")
++                            stopUserInteractionTimer()
++                            UIApplication.shared.open(comps!.url!)
++                            if isLandingViewNil {
++                                //TODO: change authChallengeError to invalidHashFunctionError
++                                self.appRequestedError = L(.invalidHashFunctionError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.invalidHashFunctionError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        
++                        
++                        let certBytes = {
++                            var base64 = certificate!
++                                .replacingOccurrences(of: "-", with: "+")
++                                .replacingOccurrences(of: "_", with: "/")
++                            if base64.count % 4 != 0 {
++                                base64.append(String(repeating: "=", count: 4 - base64.count % 4))
++                            }
++                            return base64
++                        }
++                        
++                        let certificateBytes = Data(base64Encoded: certBytes())
++                        
++                        if certificateBytes == nil {
++                            var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_INVALID_ARGUMENT", message: "webeid scheme requires 'certificate' query parameter to be Base64URL encoded")
++                            stopUserInteractionTimer()
++                            UIApplication.shared.open(comps!.url!)
++                            if isLandingViewNil {
++                                //TODO: change authChallengeError to invalidCertificateError
++                                self.appRequestedError = L(.invalidCertificateError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.invalidCertificateError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        let hashBytes = {
++                            var base64 = hash!
++                                .replacingOccurrences(of: "-", with: "+")
++                                .replacingOccurrences(of: "_", with: "/")
++                            if base64.count % 4 != 0 {
++                                base64.append(String(repeating: "=", count: 4 - base64.count % 4))
++                            }
++                            return base64
++                        }
++                        
++                        let hashValue = Data(base64Encoded: hashBytes())
++                        
++                        if hashValue == nil {
++                            var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_INVALID_ARGUMENT", message: "webeid scheme requires 'hash' query parameter to be Base64URL encoded")
++                            stopUserInteractionTimer()
++                            UIApplication.shared.open(comps!.url!)
++                            if isLandingViewNil {
++                                //TODO: change authChallengeError to invalidHashError
++                                self.appRequestedError = L(.invalidHashError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.invalidHashError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        let hashesAndSizes = ["SHA-224": 28, "SHA-384": 48, "SHA-256": 32, "SHA-512": 64, "SHA3-224": 28, "SHA3-384": 48, "SHA3-256": 32, "SHA3-512": 64]
++                        if hashesAndSizes.index(forKey: hashFunction!) == nil {
++                            var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_INVALID_ARGUMENT", message: "webeid scheme requires a valid 'hashFunction' query parameter")
++                            stopUserInteractionTimer()
++                            UIApplication.shared.open(comps!.url!)
++                            if isLandingViewNil {
++                                //TODO: change authChallengeError to invalidHashFunctionError
++                                self.appRequestedError = L(.invalidHashFunctionError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.invalidHashFunctionError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        if hashesAndSizes[hashFunction!] != hashValue!.count {
++                            var comps = URLComponents(url: callback_url!, resolvingAgainstBaseURL: true)
++                            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_INVALID_ARGUMENT", message: "webeid scheme requires 'hash' value size to match 'hashFunction' output size")
++                            stopUserInteractionTimer()
++                            UIApplication.shared.open(comps!.url!)
++                            if isLandingViewNil {
++                                //TODO: change authChallengeError to mismatchHashSizeError
++                                self.appRequestedError = L(.mismatchHashSizeError)
++                            } else {
++                                DispatchQueue.main.async {
++                                    //title: L(.errorAlertTitleGeneral),
++                                    topViewController.showErrorMessage(message: L(.mismatchHashSizeError))
++                                    self.appRequestedError = nil
++                                }
++                            }
++                            self.isWebEIDrequest = false
++                            webEIDrequest = .None
++                            tempUrl = nil
++                            return true
++                        }
++                        
++                        printLog("[+] creating signing view controller without container view...")
++                        self.isWebEIDrequest = true
++                        self.webEIDrequest = .Sign
++                        self.callerHost = callback_url!.scheme! + "://" + callback_url!.host!
++                        self.callerURL = callback_url!
++                        self.signingViewController = UIStoryboard.tokenFlow.instantiateViewController(of: TokenFlowSelectionViewController.self)
++                        //printLog("[+] TokenFlow VC initialized = App already open situation")
++                        self.signingViewController!.modalPresentationStyle = .overFullScreen
++                        self.signingViewController!.mobileIdEditViewControllerDelegate = nil
++                        self.signingViewController!.smartIdEditViewControllerDelegate = nil
++                        //self.signingViewController!.idCardSignViewControllerDelegate = nil
++                        self.signingViewController!.containerPath = "sign"
++                        self.signingViewController!.callerHost = self.callerHost
++                        self.signingViewController!.givenSigningCertificate = certificateBytes
++                        self.signingViewController!.givenHashValue = hashValue
++                        self.signingViewController!.givenHashFunction = hashFunction
++                        
++                        if landingViewController != nil {
++                            //print("[+] presenting signing view controller...")
++                            //print("[+] top view for getting signing certificate: \(topViewController)")
++                            topViewController.present(self.signingViewController!, animated: true)
++                        }
++                        
++                        return true
++                        
++                    }
++                    else {
++                        //error
++                        if isLandingViewNil {
++                            self.appRequestedError = L(.authRequestError)
++                        } else {
++                            DispatchQueue.main.async {
++                                //title: L(.errorAlertTitleGeneral), 
++                                topViewController.showErrorMessage(message: L(.authRequestError))
++                                self.appRequestedError = nil
++                            }
++                        }
++                        self.isWebEIDrequest = false
++                        webEIDrequest = .None
++                        tempUrl = nil
++                        return true
++                    }
++                }
++                //
++                
+                 // Handle file from web with "digidoc" scheme
+                 if url.scheme == "digidoc" && url.host == "http" {
+                     printLog("Opening HTTP links is not supported")
+@@ -442,6 +1264,9 @@
+ 
+         if let topController = topViewController() {
+             if topController is IdCardViewController || topController is MyeIDInfoViewController || topController is MyeIDStatusViewController {
++                if let controller = topController as? IdCardViewController {
++                    if(controller.titleLabel.text == "Please enter the 6-digit CAN printed on your ID-card" || controller.readNFC) { return }
++                }
+                 MoppLibCardReaderManager.shared.startDiscoveringReaders()
+             }
+         }
+@@ -472,6 +1297,14 @@
+ 
+         // Remove temporarily saved files folder
+         MoppFileManager.removeFiles()
++        
++        // if there is an active app-requested function, return native fatal error
++        if let caller_url = callerURL {
++            var comps = URLComponents(url: caller_url, resolvingAgainstBaseURL: true)
++            comps?.fragment = encodedAppRequestedError(code: "ERR_WEBEID_NATIVE_FATAL", message: "Application terminated with a fatal error")
++            //comps.queryItems = [URLQueryItem(name: "error", value: )]
++            UIApplication.shared.open(comps!.url!)
++        }
+     }
+ 
+     func handleEventsForBackgroundURLSession(identifier: String, completionHandler: @escaping () -> Void) {
